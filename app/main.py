@@ -26,16 +26,29 @@ class CreateUserRequest(BaseModel):
 
 def _build_vless_uri(settings: Settings, user_uuid: str, user_id: str, label: str | None) -> str:
     fragment = quote(label or user_id, safe="")
+    host = settings.user_host_for_uri or settings.bridge_domain
+
+    if settings.user_transport_mode.lower() == "reality":
+        spx = quote(settings.reality_spider_x, safe="")
+        return (
+            f"vless://{user_uuid}@{host}:{settings.user_port}"
+            f"?encryption=none&flow={settings.user_flow}&security=reality"
+            f"&sni={settings.reality_server_name}&fp={settings.reality_fingerprint}"
+            f"&pbk={settings.reality_public_key}&sid={settings.reality_short_id}"
+            f"&type=tcp&spx={spx}"
+            f"#{fragment}"
+        )
+
     encoded_path = quote(settings.user_path, safe="")
     return (
-        f"vless://{user_uuid}@{settings.bridge_domain}:{settings.user_port}"
+        f"vless://{user_uuid}@{host}:{settings.user_port}"
         f"?encryption=none&security=tls&sni={settings.bridge_domain}&type=xhttp&path={encoded_path}"
         f"#{fragment}"
     )
 
 
 def _serialize_user(settings: Settings, user: User) -> dict:
-    return {
+    payload = {
         "user_id": user.user_id,
         "uuid": user.uuid,
         "label": user.label,
@@ -43,7 +56,17 @@ def _serialize_user(settings: Settings, user: User) -> dict:
         "revoked_at": user.revoked_at.isoformat() if user.revoked_at else None,
         "active": user.revoked_at is None,
         "vless_uri": _build_vless_uri(settings, user.uuid, user.user_id, user.label),
+        "transport_mode": settings.user_transport_mode,
     }
+    if settings.user_transport_mode.lower() == "reality":
+        payload["reality"] = {
+            "server_name": settings.reality_server_name,
+            "public_key": settings.reality_public_key,
+            "short_id": settings.reality_short_id,
+            "flow": settings.user_flow,
+            "fingerprint": settings.reality_fingerprint,
+        }
+    return payload
 
 
 def _xray_is_active(service_name: str) -> bool:
@@ -53,13 +76,13 @@ def _xray_is_active(service_name: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "active"
 
 
-def _xray_listens_443() -> bool:
+def _xray_listens_port(port: int) -> bool:
     import subprocess
 
     result = subprocess.run(["ss", "-lnt"], capture_output=True, text=True)
     if result.returncode != 0:
         return False
-    return ":443" in result.stdout
+    return f":{port}" in result.stdout
 
 
 @app.on_event("startup")
@@ -81,12 +104,13 @@ def shutdown() -> None:
 
 @app.get("/health")
 def health(settings: Settings = Depends(get_settings)) -> JSONResponse:
+    xhttp_mode = settings.user_transport_mode.lower() == "xhttp"
     checks = {
         "xray_config_exists": __import__("os").path.exists(settings.xray_config),
-        "xray_cert_exists": __import__("os").path.exists("/usr/local/etc/xray/fullchain.crt"),
-        "xray_key_exists": __import__("os").path.exists("/usr/local/etc/xray/private.key"),
+        "xray_cert_exists": True if not xhttp_mode else __import__("os").path.exists("/usr/local/etc/xray/fullchain.crt"),
+        "xray_key_exists": True if not xhttp_mode else __import__("os").path.exists("/usr/local/etc/xray/private.key"),
         "xray_active": _xray_is_active(settings.xray_service),
-        "xray_listening_443": _xray_listens_443(),
+        "xray_listening_user_port": _xray_listens_port(settings.user_port),
     }
     ok = all(checks.values())
     return JSONResponse(status_code=200 if ok else 503, content={"status": "ok" if ok else "degraded", "checks": checks})

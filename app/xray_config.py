@@ -106,6 +106,7 @@ def _apply_mutation(settings: Settings, mutator: Callable[[dict], bool]) -> bool
 
 def upsert_user_client(settings: Settings, user_id: str, user_uuid: str) -> bool:
     email = f"user:{user_id}"
+    flow = settings.user_flow.strip() if settings.user_flow else ""
 
     def mutate(config: dict) -> bool:
         clients = _get_clients(config)
@@ -119,9 +120,20 @@ def upsert_user_client(settings: Settings, user_id: str, user_uuid: str) -> bool
                 if client.get("email") != email:
                     client["email"] = email
                     changed = True
+                if flow:
+                    if client.get("flow") != flow:
+                        client["flow"] = flow
+                        changed = True
+                else:
+                    if "flow" in client:
+                        client.pop("flow", None)
+                        changed = True
                 return changed
 
-        clients.append({"id": user_uuid, "email": email})
+        new_client = {"id": user_uuid, "email": email}
+        if flow:
+            new_client["flow"] = flow
+        clients.append(new_client)
         return True
 
     return _apply_mutation(settings, mutate)

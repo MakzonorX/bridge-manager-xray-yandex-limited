@@ -6,7 +6,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     bridge_domain: str
     user_port: int = 443
+    user_host_for_uri: str | None = None
     user_path: str = "/user-xh"
+    user_transport_mode: str = "reality"
+    user_network: str = "tcp"
+    user_security: str = "reality"
+    user_flow: str = "xtls-rprx-vision"
+
+    reality_server_name: str = "ads.x5.ru"
+    reality_public_key: str = ""
+    reality_short_id: str = ""
+    reality_fingerprint: str = "chrome"
+    reality_spider_x: str = "/"
 
     xray_config: str = "/usr/local/etc/xray/config.json"
     xray_service: str = "xray"
