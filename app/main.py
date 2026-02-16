@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 from urllib.parse import quote
+import logging
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -9,11 +10,13 @@ from pydantic import BaseModel, Field
 from .auth import require_token
 from .models import User
 from .settings import Settings, get_settings
-from .stats import get_user_traffic
+from .stats import TrafficCollector, get_user_traffic, persist_all_user_runtime_totals
 from .storage import get_session, init_db
 from .xray_config import XrayConfigError, remove_user_client, upsert_user_client
 
 app = FastAPI(title="Bridge Manager", version="1.0.0")
+LOG = logging.getLogger(__name__)
+traffic_collector: TrafficCollector | None = None
 
 
 class CreateUserRequest(BaseModel):
@@ -61,7 +64,19 @@ def _xray_listens_443() -> bool:
 
 @app.on_event("startup")
 def startup() -> None:
+    global traffic_collector
     init_db()
+    settings = get_settings()
+    traffic_collector = TrafficCollector(settings=settings, interval_seconds=15)
+    traffic_collector.start()
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    global traffic_collector
+    if traffic_collector is not None:
+        traffic_collector.stop()
+        traffic_collector = None
 
 
 @app.get("/health")
@@ -109,6 +124,12 @@ def create_user(
         session.add(user)
 
         try:
+            # Save current runtime counters before xray restart inside config mutation.
+            persist_all_user_runtime_totals(settings)
+        except Exception as exc:
+            LOG.warning("traffic snapshot before create_user failed: %s", exc)
+
+        try:
             upsert_user_client(settings, payload.user_id, new_uuid)
         except XrayConfigError as exc:
             session.rollback()
@@ -132,6 +153,12 @@ def delete_user(
         user = session.get(User, user_id)
         if user is None or user.revoked_at is not None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        try:
+            # Save current runtime counters before xray restart inside config mutation.
+            persist_all_user_runtime_totals(settings)
+        except Exception as exc:
+            LOG.warning("traffic snapshot before delete_user failed: %s", exc)
 
         try:
             removed = remove_user_client(settings, user_id)

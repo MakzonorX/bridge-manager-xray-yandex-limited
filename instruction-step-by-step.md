@@ -212,7 +212,14 @@ curl -s http://127.0.0.1:8080/v1/users/demo-user-1/traffic \
   -H "Authorization: Bearer $TOKEN" | jq .
 ```
 
-`0/0` допустимо.
+Ответ содержит:
+
+- `uplink_bytes`, `downlink_bytes` — накопленный трафик (persisted в SQLite).
+- `runtime_uplink_bytes`, `runtime_downlink_bytes` — текущие runtime-счётчики Xray.
+
+Важно:
+- после рестарта Xray runtime-поля могут быть `0`,
+- но накопленные `uplink_bytes/downlink_bytes` должны сохраняться.
 
 ### 7.5 Удалить пользователя
 

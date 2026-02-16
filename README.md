@@ -183,7 +183,12 @@ curl -s http://127.0.0.1:8080/v1/users/user123/traffic \
   -H "Authorization: Bearer $TOKEN" | jq .
 ```
 
-Если статистика недоступна, endpoint не падает и возвращает `0/0`.
+Поля ответа:
+
+- `uplink_bytes`, `downlink_bytes`: накопленные (persisted) значения.
+- `runtime_uplink_bytes`, `runtime_downlink_bytes`: текущие runtime counters Xray.
+
+После рестарта Xray runtime-поля могут стать `0`, но накопленные `uplink_bytes/downlink_bytes` сохраняются.
 
 ### DELETE /v1/users/{user_id}
 
