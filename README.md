@@ -133,27 +133,120 @@ curl -s http://127.0.0.1:8080/health | jq .
 
 ## REST API
 
-Базовый URL (локально):
+### Базовая информация
 
+**Базовый URL (локально):**
 - `http://127.0.0.1:8080`
 
-Эндпоинты:
+**Доступные эндпоинты:**
+- `GET /health` — проверка состояния сервиса (без авторизации)
+- `POST /v1/users` — создание/восстановление пользователя
+- `GET /v1/users/{user_id}` — получение информации о пользователе
+- `GET /v1/users/{user_id}/traffic` — получение статистики трафика пользователя
+- `DELETE /v1/users/{user_id}` — удаление (revoke) пользователя
 
-- `GET /health`
-- `POST /v1/users`
-- `GET /v1/users/{user_id}`
-- `GET /v1/users/{user_id}/traffic`
-- `DELETE /v1/users/{user_id}`
+**Авторизация:**
+- Все эндпоинты `/v1/*` требуют HTTP-заголовок: `Authorization: Bearer <API_TOKEN>`
+- Токен задаётся через переменную `API_TOKEN` при установке или в `/etc/bridge-manager/env`
+- Эндпоинт `/health` доступен без авторизации
 
-Авторизация:
+---
 
-- Все `/v1/*` требуют `Authorization: Bearer <API_TOKEN>`.
-- `/health` открытый.
+### GET /health
+
+**Описание:**  
+Проверяет состояние сервиса и зависимостей (конфигурация Xray, сертификаты, активность процессов).
+
+**Метод и путь:**
+```
+GET /health
+```
+
+**Заголовки:**  
+Не требуются.
+
+**Параметры:**  
+Отсутствуют.
+
+**Тело запроса:**  
+Отсутствует.
+
+**Пример запроса:**
+```bash
+curl -s http://127.0.0.1:8080/health | jq .
+```
+
+**Ответ при успехе (200 OK):**
+```json
+{
+  "status": "ok",
+  "checks": {
+    "xray_config_exists": true,
+    "xray_cert_exists": true,
+    "xray_key_exists": true,
+    "xray_active": true,
+    "xray_listening_user_port": true
+  }
+}
+```
+
+**Описание полей ответа:**
+- `status` (string): Общее состояние сервиса. Варианты: `"ok"`, `"degraded"`.
+- `checks` (object): Детальные проверки компонентов:
+  - `xray_config_exists` (boolean): Существует ли файл конфигурации Xray.
+  - `xray_cert_exists` (boolean): Существует ли TLS-сертификат (для режима xhttp).
+  - `xray_key_exists` (boolean): Существует ли приватный ключ (для режима xhttp).
+  - `xray_active` (boolean): Активен ли systemd-сервис Xray.
+  - `xray_listening_user_port` (boolean): Прослушивается ли порт для клиентских подключений.
+
+**Ответ при деградации (503 Service Unavailable):**
+```json
+{
+  "status": "degraded",
+  "checks": {
+    "xray_config_exists": true,
+    "xray_cert_exists": true,
+    "xray_key_exists": true,
+    "xray_active": false,
+    "xray_listening_user_port": false
+  }
+}
+```
+
+**Возможные ошибки:**
+- `503 Service Unavailable`: Одна или несколько проверок провалились (см. `checks`).
+
+---
 
 ### POST /v1/users
 
-Запрос:
+**Описание:**  
+Создаёт нового пользователя с уникальным UUID или восстанавливает существующего (если он был удалён ранее). Если пользователь уже активен, возвращает его данные. При создании/восстановлении обновляет конфигурацию Xray (добавляет клиента в inbound).
 
+**Метод и путь:**
+```
+POST /v1/users
+```
+
+**Заголовки:**
+```
+Authorization: Bearer <API_TOKEN>
+Content-Type: application/json
+```
+
+**Тело запроса:**
+```json
+{
+  "user_id": "user123",
+  "label": "User 123"
+}
+```
+
+**Описание полей запроса:**
+- `user_id` (string, обязательно): Уникальный идентификатор пользователя (1–128 символов). Используется как первичный ключ.
+- `label` (string, необязательно): Человеко-читаемая метка для пользователя (до 255 символов). Используется в VLESS URI как fragment.
+
+**Пример запроса:**
 ```bash
 TOKEN='ваш_API_TOKEN'
 
@@ -163,39 +256,387 @@ curl -s -X POST http://127.0.0.1:8080/v1/users \
   -d '{"user_id":"user123","label":"User 123"}' | jq .
 ```
 
-Ответ содержит `vless_uri` формата:
-
-```text
-vless://{UUID}@{BRIDGE_DOMAIN}:443?encryption=none&security=tls&sni={BRIDGE_DOMAIN}&type=xhttp&path=%2Fuser-xh#{label_or_userid}
+**Ответ при успехе (200 OK):**
+```json
+{
+  "user_id": "user123",
+  "uuid": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+  "label": "User 123",
+  "created_at": "2026-02-17T10:30:45.123456+00:00",
+  "revoked_at": null,
+  "active": true,
+  "vless_uri": "vless://a1b2c3d4-e5f6-4789-8abc-def012345678@test-bridge.example.com:443?encryption=none&security=tls&sni=test-bridge.example.com&type=xhttp&path=%2Fuser-xh#User%20123",
+  "transport_mode": "xhttp"
+}
 ```
+
+**Описание полей ответа:**
+- `user_id` (string): Идентификатор пользователя (тот же, что в запросе).
+- `uuid` (string): UUID пользователя для протокола VLESS (генерируется автоматически).
+- `label` (string | null): Метка пользователя.
+- `created_at` (string): Дата и время создания пользователя (ISO 8601, UTC).
+- `revoked_at` (string | null): Дата и время удаления пользователя. `null` если пользователь активен.
+- `active` (boolean): `true` если пользователь активен, `false` если удалён (revoked).
+- `vless_uri` (string): Готовая URI-строка для импорта в клиент (формат VLESS). Включает все параметры: адрес, порт, encryption, security, transport, path, SNI.
+- `transport_mode` (string): Режим транспорта. Варианты: `"xhttp"`, `"reality"`.
+
+**Дополнительные поля при transport_mode = "reality":**
+```json
+{
+  "reality": {
+    "server_name": "www.microsoft.com",
+    "public_key": "abcd1234...",
+    "short_id": "a1b2c3d4",
+    "flow": "xtls-rprx-vision",
+    "fingerprint": "chrome"
+  }
+}
+```
+
+**Описание полей reality:**
+- `server_name` (string): Имя сервера для SNI в REALITY.
+- `public_key` (string): Открытый ключ REALITY.
+- `short_id` (string): Короткий идентификатор REALITY.
+- `flow` (string): Режим flow для REALITY.
+- `fingerprint` (string): Отпечаток TLS-клиента.
+
+**Идемпотентность:**  
+Повторный вызов с тем же `user_id` (если пользователь активен) вернёт существующего пользователя без изменений. Если пользователь был ранее удалён (revoked), он будет восстановлен с новым UUID.
+
+**Возможные ошибки:**
+- `401 Unauthorized`: Отсутствует или неверный токен в заголовке `Authorization`.
+```json
+{
+  "detail": "Unauthorized"
+}
+```
+
+- `500 Internal Server Error`: Ошибка при изменении конфигурации Xray или перезапуске сервиса.
+```json
+{
+  "detail": "Failed to reload xray config: ..."
+}
+```
+
+---
 
 ### GET /v1/users/{user_id}
 
+**Описание:**  
+Возвращает полную информацию о пользователе, включая UUID, метку, статус, VLESS URI и настройки транспорта.
+
+**Метод и путь:**
+```
+GET /v1/users/{user_id}
+```
+
+**Параметры пути:**
+- `user_id` (string): Идентификатор пользователя.
+
+**Заголовки:**
+```
+Authorization: Bearer <API_TOKEN>
+```
+
+**Тело запроса:**  
+Отсутствует.
+
+**Пример запроса:**
 ```bash
+TOKEN='ваш_API_TOKEN'
+
 curl -s http://127.0.0.1:8080/v1/users/user123 \
   -H "Authorization: Bearer $TOKEN" | jq .
 ```
 
+**Ответ при успехе (200 OK):**
+```json
+{
+  "user_id": "user123",
+  "uuid": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+  "label": "User 123",
+  "created_at": "2026-02-17T10:30:45.123456+00:00",
+  "revoked_at": null,
+  "active": true,
+  "vless_uri": "vless://a1b2c3d4-e5f6-4789-8abc-def012345678@test-bridge.example.com:443?encryption=none&security=tls&sni=test-bridge.example.com&type=xhttp&path=%2Fuser-xh#User%20123",
+  "transport_mode": "xhttp"
+}
+```
+
+**Описание полей ответа:**  
+Аналогично ответу `POST /v1/users` (см. выше).
+
+**Возможные ошибки:**
+- `401 Unauthorized`: Неверный или отсутствующий токен.
+```json
+{
+  "detail": "Unauthorized"
+}
+```
+
+- `404 Not Found`: Пользователь с указанным `user_id` не найден в базе данных.
+```json
+{
+  "detail": "User not found"
+}
+```
+
+---
+
 ### GET /v1/users/{user_id}/traffic
 
+**Описание:**  
+Возвращает статистику трафика пользователя: накопленные (сохранённые в БД) значения и текущие runtime-счётчики Xray. Runtime-счётчики сбрасываются при перезапуске Xray, но накопленные значения сохраняются постоянно.
+
+**Метод и путь:**
+```
+GET /v1/users/{user_id}/traffic
+```
+
+**Параметры пути:**
+- `user_id` (string): Идентификатор пользователя.
+
+**Заголовки:**
+```
+Authorization: Bearer <API_TOKEN>
+```
+
+**Тело запроса:**  
+Отсутствует.
+
+**Пример запроса:**
 ```bash
+TOKEN='ваш_API_TOKEN'
+
 curl -s http://127.0.0.1:8080/v1/users/user123/traffic \
   -H "Authorization: Bearer $TOKEN" | jq .
 ```
 
-Поля ответа:
+**Ответ при успехе (200 OK):**
+```json
+{
+  "user_id": "user123",
+  "uplink_bytes": 1048576000,
+  "downlink_bytes": 5242880000,
+  "runtime_uplink_bytes": 524288,
+  "runtime_downlink_bytes": 2097152
+}
+```
 
-- `uplink_bytes`, `downlink_bytes`: накопленные (persisted) значения.
-- `runtime_uplink_bytes`, `runtime_downlink_bytes`: текущие runtime counters Xray.
+**Описание полей ответа:**
+- `user_id` (string): Идентификатор пользователя.
+- `uplink_bytes` (integer): Накопленный объём отправленных данных (upload) в байтах. Сохраняется в БД, не сбрасывается при перезапуске Xray.
+- `downlink_bytes` (integer): Накопленный объём полученных данных (download) в байтах. Сохраняется в БД, не сбрасывается при перезапуске Xray.
+- `runtime_uplink_bytes` (integer): Текущий runtime-счётчик отправленных данных (upload) в байтах. Показывает трафик с момента последнего запуска Xray. Сбрасывается в 0 при рестарте Xray.
+- `runtime_downlink_bytes` (integer): Текущий runtime-счётчик полученных данных (download) в байтах. Показывает трафик с момента последнего запуска Xray. Сбрасывается в 0 при рестарте Xray.
 
-После рестарта Xray runtime-поля могут стать `0`, но накопленные `uplink_bytes/downlink_bytes` сохраняются.
+**Механизм работы:**  
+Фоновый процесс (TrafficCollector) каждые 15 секунд опрашивает Xray API и сохраняет дельту трафика в БД. При запросе `/traffic` API возвращает:
+- Актуальные runtime-значения из Xray (снимок в момент запроса).
+- Накопленные totals из БД (с учётом текущей дельты).
+
+После рестарта Xray:
+- `runtime_uplink_bytes` и `runtime_downlink_bytes` становятся `0` или малыми значениями.
+- `uplink_bytes` и `downlink_bytes` продолжают накапливаться и не теряются.
+
+**Возможные ошибки:**
+- `401 Unauthorized`: Неверный или отсутствующий токен.
+```json
+{
+  "detail": "Unauthorized"
+}
+```
+
+- `404 Not Found`: Пользователь с указанным `user_id` не найден в БД.
+```json
+{
+  "detail": "User not found"
+}
+```
+
+**Примечания:**
+- Если Xray API недоступен, возвращаются только накопленные значения из БД, а runtime-поля будут `0`.
+- Для конвертации байт в удобные единицы: `1 МБ = 1048576 байт`, `1 ГБ = 1073741824 байт`.
+
+---
 
 ### DELETE /v1/users/{user_id}
 
+**Описание:**  
+Удаляет (revoke) пользователя: помечает его как неактивного в БД и удаляет из конфигурации Xray (inbound clients). Пользователь больше не сможет подключаться. Удалённый пользователь может быть восстановлен через `POST /v1/users` (получит новый UUID).
+
+**Метод и путь:**
+```
+DELETE /v1/users/{user_id}
+```
+
+**Параметры пути:**
+- `user_id` (string): Идентификатор пользователя.
+
+**Заголовки:**
+```
+Authorization: Bearer <API_TOKEN>
+```
+
+**Тело запроса:**  
+Отсутствует.
+
+**Пример запроса:**
 ```bash
+TOKEN='ваш_API_TOKEN'
+
 curl -s -X DELETE http://127.0.0.1:8080/v1/users/user123 \
   -H "Authorization: Bearer $TOKEN" | jq .
 ```
+
+**Ответ при успехе (200 OK):**
+```json
+{
+  "status": "deleted",
+  "user_id": "user123",
+  "removed_from_xray": true
+}
+```
+
+**Описание полей ответа:**
+- `status` (string): Статус операции. Всегда `"deleted"` при успехе.
+- `user_id` (string): Идентификатор удалённого пользователя.
+- `removed_from_xray` (boolean): `true` если пользователь был найден и удалён из конфигурации Xray. `false` если пользователь не был найден в конфигурации (уже удалён ранее или не добавлялся).
+
+**Побочные эффекты:**
+- Запись в БД помечается: `revoked_at = <текущее время UTC>`.
+- Клиент удаляется из inbound `inbound-from-users` в `/usr/local/etc/xray/config.json`.
+- Xray перезагружается (либо через systemd restart, либо через API, в зависимости от настроек).
+- Накопленная статистика трафика (`uplink_bytes`, `downlink_bytes`) сохраняется в БД и доступна для анализа.
+
+**Возможные ошибки:**
+- `401 Unauthorized`: Неверный или отсутствующий токен.
+```json
+{
+  "detail": "Unauthorized"
+}
+```
+
+- `404 Not Found`: Пользователь не найден или уже был удалён ранее.
+```json
+{
+  "detail": "User not found"
+}
+```
+
+- `500 Internal Server Error`: Ошибка при изменении конфигурации Xray.
+```json
+{
+  "detail": "Failed to remove user from xray config: ..."
+}
+```
+
+---
+
+### Примеры использования API
+
+#### Полный цикл работы с пользователем
+
+```bash
+# 1. Установить токен
+export TOKEN='your_secret_api_token_here'
+
+# 2. Проверить здоровье сервиса
+curl -s http://127.0.0.1:8080/health | jq .
+
+# 3. Создать пользователя
+curl -s -X POST http://127.0.0.1:8080/v1/users \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"alice","label":"Alice Smith"}' | jq .
+
+# Ответ: получите vless_uri, которую можно импортировать в клиент
+
+# 4. Получить информацию о пользователе
+curl -s http://127.0.0.1:8080/v1/users/alice \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# 5. Проверить статистику трафика
+curl -s http://127.0.0.1:8080/v1/users/alice/traffic \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Ответ:
+# {
+#   "user_id": "alice",
+#   "uplink_bytes": 0,
+#   "downlink_bytes": 0,
+#   "runtime_uplink_bytes": 0,
+#   "runtime_downlink_bytes": 0
+# }
+
+# 6. После использования клиентом — проверить снова
+curl -s http://127.0.0.1:8080/v1/users/alice/traffic \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Ответ:
+# {
+#   "user_id": "alice",
+#   "uplink_bytes": 52428800,
+#   "downlink_bytes": 524288000,
+#   "runtime_uplink_bytes": 52428800,
+#   "runtime_downlink_bytes": 524288000
+# }
+
+# 7. Удалить пользователя
+curl -s -X DELETE http://127.0.0.1:8080/v1/users/alice \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Ответ:
+# {
+#   "status": "deleted",
+#   "user_id": "alice",
+#   "removed_from_xray": true
+# }
+
+# 8. Попытка получить удалённого пользователя вернёт 404
+curl -s http://127.0.0.1:8080/v1/users/alice \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# Ответ:
+# {
+#   "detail": "User not found"
+# }
+
+# 9. Восстановление пользователя (получит новый UUID)
+curl -s -X POST http://127.0.0.1:8080/v1/users \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"alice","label":"Alice Smith (restored)"}' | jq .
+```
+
+#### Массовое создание пользователей
+
+```bash
+export TOKEN='your_secret_api_token_here'
+
+for i in {1..10}; do
+  curl -s -X POST http://127.0.0.1:8080/v1/users \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"user_id\":\"user$i\",\"label\":\"User $i\"}" | jq -r '.vless_uri'
+done
+```
+
+#### Мониторинг трафика
+
+```bash
+export TOKEN='your_secret_api_token_here'
+
+# Получить трафик для конкретного пользователя
+curl -s http://127.0.0.1:8080/v1/users/alice/traffic \
+  -H "Authorization: Bearer $TOKEN" | \
+  jq '{user: .user_id, total_gb: ((.uplink_bytes + .downlink_bytes) / 1073741824 | round)}'
+
+# Пример вывода:
+# {
+#   "user": "alice",
+#   "total_gb": 5
+# }
 
 ---
 
