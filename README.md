@@ -13,14 +13,19 @@
 
 ---
 
-## Что уже зашито в проекте (константы exit)
+## Дефолтные параметры exit-node (переопределяемые через env)
 
-- `EXIT_HOST = s1.bytestand.fun`
-- `EXIT_PORT = 443`
-- `EXIT_TRANSPORT = xhttp`
-- `EXIT_PATH = /bridge-xh`
-- `BRIDGE_UUID_FOR_EXIT = 7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0`
-- `EXIT_TLS = true`, `serverName = s1.bytestand.fun`
+Значения по умолчанию — ваш текущий exit-сервер. Все параметры можно переопределить при запуске bootstrap:
+
+| Переменная | Дефолт | Описание |
+|---|---|---|
+| `EXIT_HOST` | `s1.bytestand.fun` | Хост exit-node |
+| `EXIT_PORT` | `443` | Порт exit-node |
+| `EXIT_PATH` | `/bridge-xh` | XHTTP path до exit |
+| `EXIT_SERVER_NAME` | *(равен EXIT_HOST)* | TLS SNI к exit |
+| `BRIDGE_UUID_FOR_EXIT` | `7d28c9a1-...` | UUID bridge-клиента на exit |
+
+Транспорт bridge→exit всегда `VLESS + XHTTP + TLS` (не меняется).
 
 ---
 
@@ -30,7 +35,7 @@
 2. Домен bridge (например `test-bridge.example.com`) уже указывает A-записью на IP этого сервера.
 3. Порты открыты снаружи:
 - `22/tcp`
-- `80/tcp` (для выпуска сертификата)
+- `80/tcp` (только при `USER_MODE=xhttp` — для выпуска сертификата)
 - `443/tcp`
 
 Если API хотите открыть наружу, потребуется также `8080/tcp`.
@@ -48,11 +53,45 @@ cd /opt/bridge-manager
 
 ### 2. Запустить bootstrap
 
+Минимальный запуск (режим REALITY, API только локально):
+
 ```bash
 sudo BRIDGE_DOMAIN=bridge.example.com \
-ACME_EMAIL=admin@example.com \
 API_TOKEN='очень_длинный_секрет' \
-API_PUBLIC=false \
+./scripts/bootstrap_bridge.sh
+```
+
+Полная команда — все параметры явно, API открыт наружу, протокол клиент→bridge = xhttp, кастомный exit-node:
+
+```bash
+sudo BRIDGE_DOMAIN='bridge.example.com' \
+ACME_EMAIL='admin@example.com' \
+API_TOKEN='очень_длинный_секрет' \
+API_PUBLIC=true \
+USER_MODE=xhttp \
+USER_PORT=443 \
+USER_PATH='/user-xh' \
+EXIT_HOST='s1.bytestand.fun' \
+EXIT_PORT=443 \
+EXIT_PATH='/bridge-xh' \
+EXIT_SERVER_NAME='s1.bytestand.fun' \
+BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
+./scripts/bootstrap_bridge.sh
+```
+
+То же, но с режимом REALITY (без ACME, без TLS-сертификата на bridge):
+
+```bash
+sudo BRIDGE_DOMAIN='bridge.example.com' \
+API_TOKEN='очень_длинный_секрет' \
+API_PUBLIC=true \
+USER_MODE=reality \
+USER_PORT=443 \
+REALITY_SERVER_NAME='ads.x5.ru' \
+EXIT_HOST='s1.bytestand.fun' \
+EXIT_PORT=443 \
+EXIT_PATH='/bridge-xh' \
+BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
 ./scripts/bootstrap_bridge.sh
 ```
 
@@ -64,8 +103,8 @@ API_PUBLIC=false \
 2. Включает time sync.
 3. Настраивает firewall (`22/80/443`, а `8080` только если `API_PUBLIC=true`).
 4. Ставит Xray `v26.2.6` в `/usr/local/bin/xray`.
-5. Выпускает Let's Encrypt сертификат через `acme.sh` (standalone).
-6. Пишет Xray-конфиг bridge в `/usr/local/etc/xray/config.json`.
+5. *(Только `USER_MODE=xhttp`)* Выпускает Let's Encrypt сертификат через `acme.sh` (standalone).
+6. Пишет Xray-конфиг bridge в `/usr/local/etc/xray/config.json` (в соответствии с `USER_MODE`).
 7. Поднимает `xray.service`.
 8. Ставит Python venv и зависимости Bridge Manager.
 9. Пишет env-файл `/etc/bridge-manager/env`.
@@ -75,27 +114,52 @@ API_PUBLIC=false \
 
 ## Переменные bootstrap
 
-Обязательные:
+### Обязательные
 
-- `BRIDGE_DOMAIN`
-- `ACME_EMAIL`
-- `API_TOKEN`
+| Переменная | Описание |
+|---|---|
+| `BRIDGE_DOMAIN` | Домен этого bridge-сервера (A-запись уже указывает на IP) |
+| `API_TOKEN` | Секретный токен для `Authorization: Bearer` |
+| `ACME_EMAIL` | Email для Let's Encrypt — **обязателен только при `USER_MODE=xhttp`** |
 
-Опциональные:
+### Протокол клиент → bridge (`USER_MODE`)
 
-- `API_PUBLIC=false|true` (по умолчанию `false`)
-- `DISABLE_IPV6=true|false` (по умолчанию `true`)
+| Переменная | Значения | По умолчанию | Описание |
+|---|---|---|---|
+| `USER_MODE` | `reality` / `xhttp` | `reality` | Транспорт для входящих пользовательских подключений |
+| `USER_PORT` | число | `443` | Порт inbound |
+| `USER_PATH` | строка | `/user-xh` | XHTTP path (только `USER_MODE=xhttp`) |
+| `USER_FLOW` | строка | `xtls-rprx-vision` | Flow (только `USER_MODE=reality`) |
+| `USER_HOST_FOR_URI` | строка | *(BRIDGE_DOMAIN)* | Хост в генерируемых vless:// ссылках |
 
-Пример:
+**REALITY-параметры** (только при `USER_MODE=reality`):
 
-```bash
-sudo BRIDGE_DOMAIN=test-bridge.example.com \
-ACME_EMAIL=admin@example.com \
-API_TOKEN='supersecret' \
-API_PUBLIC=false \
-DISABLE_IPV6=true \
-./scripts/bootstrap_bridge.sh
-```
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `REALITY_SERVER_NAME` | `ads.x5.ru` | SNI и serverName для REALITY |
+| `REALITY_DEST` | `REALITY_SERVER_NAME:443` | Реальный бэкенд для REALITY |
+| `REALITY_SHORT_ID` | *(случайный hex)* | Short ID REALITY |
+| `REALITY_PRIVATE_KEY` | *(генерируется)* | x25519 private key |
+| `REALITY_PUBLIC_KEY` | *(выводится из private)* | x25519 public key |
+| `REALITY_FINGERPRINT` | `chrome` | TLS fingerprint |
+| `REALITY_SPIDER_X` | `/` | spiderX |
+
+### Параметры exit-node (bridge → exit)
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `EXIT_HOST` | `s1.bytestand.fun` | Хост exit-ноды |
+| `EXIT_PORT` | `443` | Порт exit-ноды |
+| `EXIT_PATH` | `/bridge-xh` | XHTTP path на exit |
+| `EXIT_SERVER_NAME` | *(равен EXIT_HOST)* | TLS SNI при подключении к exit |
+| `BRIDGE_UUID_FOR_EXIT` | `7d28c9a1-...` | UUID этого bridge на exit-ноде |
+
+### API и система
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `API_PUBLIC` | `false` | `true` → API на `0.0.0.0:8080`, UFW открывает порт |
+| `DISABLE_IPV6` | `true` | Отключить IPv6 через sysctl |
 
 ---
 

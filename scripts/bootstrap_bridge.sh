@@ -7,11 +7,12 @@ XRAY_ETC_DIR="/usr/local/etc/xray"
 XRAY_SHARE_DIR="/usr/local/share/xray"
 XRAY_CONFIG="${XRAY_ETC_DIR}/config.json"
 
-EXIT_HOST="s1.bytestand.fun"
-EXIT_PORT="443"
-EXIT_PATH="/bridge-xh"
-BRIDGE_UUID_FOR_EXIT="7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0"
-EXIT_SERVER_NAME="s1.bytestand.fun"
+# Default exit-node constants (overridable via env)
+_DEFAULT_EXIT_HOST="s1.bytestand.fun"
+_DEFAULT_EXIT_PORT="443"
+_DEFAULT_EXIT_PATH="/bridge-xh"
+_DEFAULT_BRIDGE_UUID_FOR_EXIT="7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0"
+_DEFAULT_EXIT_SERVER_NAME="s1.bytestand.fun"
 
 APP_DST="/opt/bridge-manager"
 APP_ENV_FILE="/etc/bridge-manager/env"
@@ -30,14 +31,14 @@ Required env:
 Required only in xhttp mode:
   ACME_EMAIL
 
-Optional env:
-  USER_MODE=reality|xhttp  (default: reality)
-  USER_PORT=443          (default: 443)
-  USER_PATH=/user-xh       (default: /user-xh, xhttp mode)
-  USER_FLOW=xtls-rprx-vision (default: xtls-rprx-vision)
-  USER_HOST_FOR_URI=<host-or-ip-for-client-link>
+Optional env (User->Bridge inbound):
+  USER_MODE=reality|xhttp          (default: reality)
+  USER_PORT=443                    (default: 443)
+  USER_PATH=/user-xh               (default: /user-xh, xhttp mode only)
+  USER_FLOW=xtls-rprx-vision       (default: xtls-rprx-vision)
+  USER_HOST_FOR_URI=<host-or-ip>   (override host in generated vless:// links)
 
-  REALITY_SERVER_NAME=ads.x5.ru   (default: ads.x5.ru)
+  REALITY_SERVER_NAME=ads.x5.ru    (default: ads.x5.ru)
   REALITY_DEST=ads.x5.ru:443       (default: REALITY_SERVER_NAME:443)
   REALITY_SHORT_ID=<hex>           (default: random hex)
   REALITY_PRIVATE_KEY=<x25519 private key>
@@ -45,12 +46,20 @@ Optional env:
   REALITY_FINGERPRINT=chrome       (default: chrome)
   REALITY_SPIDER_X=/               (default: /)
 
-  API_PUBLIC=false|true   (default: false)
-  DISABLE_IPV6=true|false (default: true)
+Optional env (Bridge->Exit outbound):
+  EXIT_HOST=s1.bytestand.fun       (default: s1.bytestand.fun)
+  EXIT_PORT=443                    (default: 443)
+  EXIT_PATH=/bridge-xh             (default: /bridge-xh)
+  EXIT_SERVER_NAME=s1.bytestand.fun (default: same as EXIT_HOST)
+  BRIDGE_UUID_FOR_EXIT=<uuid>      (default: built-in uuid)
+
+Optional env (API / system):
+  API_PUBLIC=false|true            (default: false)
+  DISABLE_IPV6=true|false          (default: true)
 
 Notes:
   - User->Bridge mode is REALITY by default.
-  - Bridge->Exit stays VLESS + XHTTP + TLS.
+  - Bridge->Exit always uses VLESS + XHTTP + TLS.
   - If API_PUBLIC=true, UFW opens 8080/tcp.
 EOF_USAGE
 }
@@ -582,6 +591,12 @@ main() {
   REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
   REALITY_FINGERPRINT="${REALITY_FINGERPRINT:-chrome}"
   REALITY_SPIDER_X="${REALITY_SPIDER_X:-/}"
+
+  EXIT_HOST="${EXIT_HOST:-${_DEFAULT_EXIT_HOST}}"
+  EXIT_PORT="${EXIT_PORT:-${_DEFAULT_EXIT_PORT}}"
+  EXIT_PATH="${EXIT_PATH:-${_DEFAULT_EXIT_PATH}}"
+  EXIT_SERVER_NAME="${EXIT_SERVER_NAME:-${EXIT_HOST}}"
+  BRIDGE_UUID_FOR_EXIT="${BRIDGE_UUID_FOR_EXIT:-${_DEFAULT_BRIDGE_UUID_FOR_EXIT}}"
 
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage

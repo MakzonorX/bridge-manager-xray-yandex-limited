@@ -24,23 +24,36 @@
 
 ## 1) Данные, которые подготовить заранее
 
-На своей стороне подготовьте 3 обязательных параметра:
+Обязательные параметры:
 
 1. `BRIDGE_DOMAIN`
-- Пример: `test-bridge.example.com`
-- Требование: A-запись этого домена уже указывает на публичный IP нового сервера.
+ - Пример: `test-bridge.example.com`
+ - Требование: A-запись этого домена уже указывает на публичный IP нового сервера.
 
-2. `ACME_EMAIL`
-- Email для выпуска TLS сертификата через Let's Encrypt/acme.sh.
+2. `API_TOKEN`
+ - Длинный секрет для `Authorization: Bearer <token>`.
 
-3. `API_TOKEN`
-- Длинный секрет для `Authorization: Bearer <token>`.
+3. `ACME_EMAIL` (только если `USER_MODE=xhttp`)
+ - Email для выпуска TLS сертификата через Let's Encrypt/acme.sh.
+ - При `USER_MODE=reality` не нужен.
 
-Опционально:
+Параметр протокола (клиент → bridge):
 
-4. `API_PUBLIC`
-- `false` (рекомендовано): API только на `127.0.0.1:8080`.
-- `true`: API слушает `0.0.0.0:8080` и открывается в UFW.
+4. `USER_MODE`
+ - `reality` (по умолчанию): VLESS + REALITY. Сертификат на bridge не нужен.
+ - `xhttp`: VLESS + XHTTP + TLS. Требует `ACME_EMAIL` и открытый `80/tcp`.
+
+Параметры exit-ноды (bridge → exit):
+
+5. `EXIT_HOST` — хост exit-ноды (дефолт: `s1.bytestand.fun`)
+6. `EXIT_PORT` — порт exit-ноды (дефолт: `443`)
+7. `EXIT_PATH` — XHTTP path на exit (дефолт: `/bridge-xh`)
+8. `EXIT_SERVER_NAME` — TLS SNI (дефолт: равен `EXIT_HOST`)
+9. `BRIDGE_UUID_FOR_EXIT` — UUID этого bridge-клиента на exit-ноде (дефолт: built-in)
+
+Прочее опциональное:
+
+10. `API_PUBLIC`
 
 ---
 
@@ -87,41 +100,72 @@ ls -l scripts/bootstrap_bridge.sh
 
 ## 4) Запуск bootstrap (основной шаг)
 
-Запустите так:
+### Вариант A: USER_MODE=reality (рекомендуется)
+
+Не требует ACME_EMAIL и открытого `80/tcp`. Сертификат на bridge не выпускается.
+
+**Минимальный запуск:**
 
 ```bash
 sudo BRIDGE_DOMAIN='<ВАШ_ДОМЕН>' \
-ACME_EMAIL='<ВАШ_EMAIL>' \
-API_TOKEN='<ВАШ_API_TOKEN>' \
-API_PUBLIC=false \
+API_TOKEN='<ВАШ_ТОКЕН>' \
 ./scripts/bootstrap_bridge.sh
 ```
 
-Опционально можно добавить:
+**Полный запуск со всеми параметрами (кастомный exit, API наружу):**
 
 ```bash
-DISABLE_IPV6=true
+sudo BRIDGE_DOMAIN='bridge.example.com' \
+API_TOKEN='super_secret_token_value' \
+API_PUBLIC=true \
+USER_MODE=reality \
+USER_PORT=443 \
+USER_FLOW=xtls-rprx-vision \
+REALITY_SERVER_NAME='ads.x5.ru' \
+EXIT_HOST='s1.bytestand.fun' \
+EXIT_PORT=443 \
+EXIT_PATH='/bridge-xh' \
+EXIT_SERVER_NAME='s1.bytestand.fun' \
+BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
+DISABLE_IPV6=true \
+./scripts/bootstrap_bridge.sh
 ```
 
-Пример полного запуска:
+---
+
+### Вариант B: USER_MODE=xhttp
+
+Клиент подключается по VLESS + XHTTP + TLS. Требуется `ACME_EMAIL` и доступный снаружи `80/tcp` для выпуска сертификата.
+
+**Полный запуск со всеми параметрами (кастомный exit, API наружу):**
 
 ```bash
 sudo BRIDGE_DOMAIN='bridge.example.com' \
 ACME_EMAIL='admin@example.com' \
 API_TOKEN='super_secret_token_value' \
-API_PUBLIC=false \
+API_PUBLIC=true \
+USER_MODE=xhttp \
+USER_PORT=443 \
+USER_PATH='/user-xh' \
+EXIT_HOST='s1.bytestand.fun' \
+EXIT_PORT=443 \
+EXIT_PATH='/bridge-xh' \
+EXIT_SERVER_NAME='s1.bytestand.fun' \
+BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
 DISABLE_IPV6=true \
 ./scripts/bootstrap_bridge.sh
 ```
 
-Что делает скрипт автоматически:
+---
+
+### Что делает скрипт автоматически
 
 1. Устанавливает системные пакеты.
 2. Включает синхронизацию времени.
 3. Настраивает UFW (`22`, `80`, `443`, и `8080` если `API_PUBLIC=true`).
 4. Ставит Xray `v26.2.6`.
-5. Выпускает TLS сертификат через acme.sh standalone (`:80`).
-6. Пишет Xray конфиг bridge.
+5. *(Только `USER_MODE=xhttp`)* Выпускает TLS-сертификат через acme.sh standalone (`:80`).
+6. Пишет Xray-конфиг bridge (в соответствии с выбранным режимом).
 7. Включает и стартует `xray.service`.
 8. Создаёт Python venv, ставит зависимости Bridge Manager.
 9. Пишет `/etc/bridge-manager/env`.
@@ -368,14 +412,38 @@ Authorization: Bearer <API_TOKEN>
 ```bash
 cd /opt/bridge-manager
 git pull
+```
+
+Затем повторно запустите bootstrap с теми же параметрами, с которыми сервер был установлен изначально. Скрипт идемпотентен — переустановит/актуализирует состояние.
+
+Пример для `USER_MODE=reality`:
+
+```bash
+sudo BRIDGE_DOMAIN='<ВАШ_ДОМЕН>' \
+API_TOKEN='<ВАШ_API_TOKEN>' \
+API_PUBLIC=false \
+USER_MODE=reality \
+EXIT_HOST='<EXIT_HOST>' \
+EXIT_PORT=443 \
+EXIT_PATH='<EXIT_PATH>' \
+BRIDGE_UUID_FOR_EXIT='<UUID>' \
+./scripts/bootstrap_bridge.sh
+```
+
+Пример для `USER_MODE=xhttp`:
+
+```bash
 sudo BRIDGE_DOMAIN='<ВАШ_ДОМЕН>' \
 ACME_EMAIL='<ВАШ_EMAIL>' \
 API_TOKEN='<ВАШ_API_TOKEN>' \
 API_PUBLIC=false \
+USER_MODE=xhttp \
+EXIT_HOST='<EXIT_HOST>' \
+EXIT_PORT=443 \
+EXIT_PATH='<EXIT_PATH>' \
+BRIDGE_UUID_FOR_EXIT='<UUID>' \
 ./scripts/bootstrap_bridge.sh
 ```
-
-Скрипт переустановит/актуализирует состояние.
 
 ---
 
