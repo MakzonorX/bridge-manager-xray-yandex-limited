@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from .auth import require_token
 from .models import User
 from .settings import Settings, get_settings
-from .stats import TrafficCollector, get_user_traffic, persist_all_user_runtime_totals
+from .stats import TrafficCollector, get_user_traffic, persist_all_user_runtime_totals, traffic_state_guard
 from .storage import get_session, init_db
 from .xray_config import XrayConfigError, remove_user_client, upsert_user_client
 
@@ -148,13 +148,14 @@ def create_user(
         session.add(user)
 
         try:
-            # Save current runtime counters before xray restart inside config mutation.
-            persist_all_user_runtime_totals(settings)
-        except Exception as exc:
-            LOG.warning("traffic snapshot before create_user failed: %s", exc)
+            with traffic_state_guard():
+                try:
+                    # Save current runtime counters before xray restart inside config mutation.
+                    persist_all_user_runtime_totals(settings)
+                except Exception as exc:
+                    LOG.warning("traffic snapshot before create_user failed: %s", exc)
 
-        try:
-            upsert_user_client(settings, payload.user_id, new_uuid)
+                upsert_user_client(settings, payload.user_id, new_uuid)
         except XrayConfigError as exc:
             session.rollback()
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
@@ -179,13 +180,14 @@ def delete_user(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
         try:
-            # Save current runtime counters before xray restart inside config mutation.
-            persist_all_user_runtime_totals(settings)
-        except Exception as exc:
-            LOG.warning("traffic snapshot before delete_user failed: %s", exc)
+            with traffic_state_guard():
+                try:
+                    # Save current runtime counters before xray restart inside config mutation.
+                    persist_all_user_runtime_totals(settings)
+                except Exception as exc:
+                    LOG.warning("traffic snapshot before delete_user failed: %s", exc)
 
-        try:
-            removed = remove_user_client(settings, user_id)
+                removed = remove_user_client(settings, user_id)
         except XrayConfigError as exc:
             session.rollback()
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc

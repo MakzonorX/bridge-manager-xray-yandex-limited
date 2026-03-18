@@ -11,6 +11,7 @@ import portalocker
 from .settings import Settings
 
 USER_INBOUND_TAG = "inbound-from-users"
+XRAY_API_READY_PATTERN = "user>>>user:"
 
 
 class XrayConfigError(RuntimeError):
@@ -71,6 +72,65 @@ def _restart_xray(settings: Settings) -> None:
     _run_checked(["systemctl", "restart", settings.xray_service], timeout=20)
 
 
+def _probe_xray_api_ready(settings: Settings, probe_timeout: int = 4) -> bool:
+    result = subprocess.run(
+        [
+            settings.xray_bin,
+            "api",
+            "statsquery",
+            "--server",
+            settings.xray_api_addr,
+            "-pattern",
+            XRAY_API_READY_PATTERN,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=probe_timeout,
+    )
+    if result.returncode != 0:
+        return False
+
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return False
+
+    try:
+        json.loads(raw)
+        return True
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return False
+        try:
+            json.loads(raw[start : end + 1])
+            return True
+        except json.JSONDecodeError:
+            return False
+
+
+def _wait_for_xray_api_ready(
+    settings: Settings,
+    *,
+    ready_timeout: float = 20.0,
+    interval_seconds: float = 0.5,
+) -> None:
+    deadline = time.monotonic() + ready_timeout
+    last_error = "xray api did not become ready in time"
+    time.sleep(0.2)
+
+    while time.monotonic() < deadline:
+        try:
+            if _probe_xray_api_ready(settings):
+                return
+            last_error = "xray api probe returned no valid stats response"
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(interval_seconds)
+
+    raise XrayConfigError(f"Xray API is not ready after restart: {last_error}")
+
+
 def _apply_mutation(settings: Settings, mutator: Callable[[dict], bool]) -> bool:
     config_path = Path(settings.xray_config)
     lock_path = Path(f"{settings.xray_config}.lock")
@@ -90,6 +150,7 @@ def _apply_mutation(settings: Settings, mutator: Callable[[dict], bool]) -> bool
         try:
             _validate_xray_config(settings)
             _restart_xray(settings)
+            _wait_for_xray_api_ready(settings)
             return True
         except Exception as exc:
             shutil.copy2(backup_path, config_path)
@@ -99,6 +160,10 @@ def _apply_mutation(settings: Settings, mutator: Callable[[dict], bool]) -> bool
                 pass
             try:
                 _restart_xray(settings)
+            except Exception:
+                pass
+            try:
+                _wait_for_xray_api_ready(settings)
             except Exception:
                 pass
             raise XrayConfigError(f"Failed to apply Xray config: {exc}") from exc
