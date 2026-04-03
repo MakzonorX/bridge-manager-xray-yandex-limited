@@ -19,6 +19,12 @@
 - `GET /v1/users/{user_id}/traffic`
 - `DELETE /v1/users/{user_id}`
 - `GET /health`
+5. **Ограничение трафика по ключу**: для каждого пользователя можно задать лимит трафика.
+- `GET /v1/users/{user_id}/limit-policy` — текущая политика
+- `PUT /v1/users/{user_id}/limit-policy` — установить/обновить политику
+- Два режима: `unlimited` (без ограничений) и `limited` (лимит в байтах)
+- Две политики после достижения лимита: `throttle` (замедление до 100 KB/s) или `block` (полная блокировка)
+- Enforcement работает автоматически через фоновый цикл + tc shaping + Xray routing
 
 ---
 
@@ -272,6 +278,76 @@ curl -s -X DELETE http://127.0.0.1:8080/v1/users/demo-user-1 \
   -H "Authorization: Bearer $TOKEN" | jq .
 ```
 
+### 7.6 Ограничение трафика: получить текущую политику
+
+```bash
+curl -s http://127.0.0.1:8080/v1/users/demo-user-1/limit-policy \
+  -H "Authorization: Bearer $TOKEN" | jq .
+```
+
+Ответ по умолчанию (для нового пользователя):
+
+```json
+{
+  "user_id": "demo-user-1",
+  "mode": "unlimited",
+  "traffic_limit_bytes": null,
+  "post_limit_action": null,
+  "throttle_rate_bytes_per_sec": null,
+  "enforcement_state": "none",
+  "limit_reached_at": null,
+  "total_bytes_observed": 0
+}
+```
+
+Важные поля:
+- `mode`: `"unlimited"` — нет ограничений; `"limited"` — лимит задан.
+- `enforcement_state`: `"none"` — ограничение не применено; `"throttled"` — скорость снижена; `"blocked"` — трафик обнулён.
+- `total_bytes_observed`: суммарный трафик пользователя (uplink + downlink) в байтах.
+
+### 7.7 Ограничение трафика: установить политику
+
+**Пример 1: Лимит 10 GB + замедление до 100 KB/s после достижения**
+
+```bash
+curl -s -X PUT http://127.0.0.1:8080/v1/users/demo-user-1/limit-policy \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"limited","traffic_limit_bytes":10737418240,"post_limit_action":"throttle","throttle_rate_bytes_per_sec":102400}' | jq .
+```
+
+**Пример 2: Лимит 5 GB + полная блокировка после достижения**
+
+```bash
+curl -s -X PUT http://127.0.0.1:8080/v1/users/demo-user-1/limit-policy \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"limited","traffic_limit_bytes":5368709120,"post_limit_action":"block"}' | jq .
+```
+
+**Пример 3: Снять ограничения (вернуть unlimited)**
+
+```bash
+curl -s -X PUT http://127.0.0.1:8080/v1/users/demo-user-1/limit-policy \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"unlimited"}' | jq .
+```
+
+**Как это работает:**
+
+1. Вы задаёте `mode=limited` с лимитом (`traffic_limit_bytes`) и действием (`post_limit_action`).
+2. Фоновый процесс каждые 15 секунд проверяет суммарный трафик пользователя (uplink + downlink).
+3. Когда `total_bytes >= traffic_limit_bytes`, срабатывает enforcement:
+   - **throttle**: Xray перенаправляет трафик пользователя в отдельный outbound. Linux tc ограничивает скорость этого outbound до заданного значения (по умолчанию 102400 B/s = 100 KB/s). Пользователь остаётся подключаемым, но медленно.
+   - **block**: Xray перенаправляет трафик в blackhole outbound. Пользователь не может передавать данные вообще. UUID и ключ НЕ удаляются.
+4. После изменения enforcement Xray перезапускается (systemctl restart).
+5. Enforcement переживает рестарты bridge-manager и Xray — состояние хранится в SQLite.
+6. Для снятия: отправьте `PUT` с `{"mode":"unlimited"}`. Enforcement сбрасывается, routing/tc правила убираются.
+
+**Точность лимита:**
+Лимит проверяется с интервалом ~15 секунд. Перелёт на объём трафика за один интервал возможен и является ожидаемым ограничением.
+
 ---
 
 ## 8) Проверка, что user реально попадает в Xray
@@ -373,6 +449,26 @@ systemctl status bridge-manager --no-pager
 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
 ```
 
+Логи enforcement (ограничение трафика):
+
+```bash
+journalctl -u bridge-manager --no-pager | grep -E 'policy_changed|limit_reached|throttle_applied|block_applied|enforcement_cleared|xray_reload'
+```
+
+Проверка tc shaping:
+
+```bash
+tc -s qdisc show dev $(ip route show default | awk '/default/{print $5}')
+tc -s class show dev $(ip route show default | awk '/default/{print $5}')
+```
+
+Проверка enforcement rules в Xray config:
+
+```bash
+jq '.routing.rules[] | select(.attrs._enforcement)' /usr/local/etc/xray/config.json
+jq '.outbounds[] | select(.tag=="to-exit-throttled")' /usr/local/etc/xray/config.json
+```
+
 ---
 
 ## 13) Что делать при типовых проблемах
@@ -402,6 +498,41 @@ Authorization: Bearer <API_TOKEN>
 1. Логи `bridge-manager`.
 2. Валидацию Xray-конфига (`xray run -test ...`).
 3. Статус `xray.service`.
+
+### Проблема: throttle не работает (скорость не ограничивается)
+
+Проверьте:
+
+1. Установлен ли iproute2: `which tc`
+2. Настроен ли tc: `tc -s qdisc show dev <iface>` — должен быть htb qdisc.
+3. Есть ли в Xray config outbound `to-exit-throttled`: `jq '.outbounds[].tag' /usr/local/etc/xray/config.json`
+4. Есть ли routing rules enforcement: `jq '.routing.rules[] | select(.attrs._enforcement)' /usr/local/etc/xray/config.json`
+5. Значение fwmark совпадает: `LIMITED_TC_MARK` в `/etc/bridge-manager/env` и `sockopt.mark` в Xray outbound.
+
+Переприменить tc:
+
+```bash
+sudo LIMITED_THROTTLE_RATE_BYTES_PER_SEC=102400 /opt/bridge-manager/scripts/setup_tc.sh
+```
+
+### Проблема: enforcement_state не меняется
+
+Проверьте:
+
+1. Политика задана правильно: `curl .../limit-policy` — `mode` должен быть `limited`.
+2. Трафик достиг лимита: `total_bytes_observed >= traffic_limit_bytes`.
+3. Enrollment loop работает: в логах bridge-manager должны быть записи `limit_reached`.
+
+### Проблема: пользователь заблокирован, нужно разблокировать
+
+```bash
+curl -X PUT http://127.0.0.1:8080/v1/users/<user_id>/limit-policy \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"unlimited"}'
+```
+
+Это сбросит `enforcement_state` в `"none"`, уберёт routing rules и снимет throttle/block.
 
 ---
 
@@ -456,5 +587,8 @@ BRIDGE_UUID_FOR_EXIT='<UUID>' \
 5. Пользователь появляется в `clients` inbound `inbound-from-users`
 6. `DELETE /v1/users/{user_id}` удаляет клиента из `clients`
 7. Socks smoke проходит, chain до exit работает
+8. `GET /v1/users/{user_id}/limit-policy` возвращает `mode=unlimited` (дефолт)
+9. `PUT /v1/users/{user_id}/limit-policy` с `mode=limited` принимается без ошибок
+10. `tc -s qdisc show` показывает htb qdisc на egress-интерфейсе (если `LIMITED_TC_ENABLED=true`)
 
 Если все пункты выполнены, установка успешна.
