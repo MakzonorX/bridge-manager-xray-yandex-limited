@@ -1,4 +1,6 @@
-# Bridge Manager + Xray Bridge (RU)
+# Bridge Manager + Xray Bridge — Yandex Limited Edition (RU)
+
+Форк bridge-manager-xray с фичей **ограничения трафика на уровне пользователя** для аварийных/дорогих bridge-node (Yandex Cloud).
 
 Готовое решение для схемы:
 
@@ -704,6 +706,150 @@ curl -s http://127.0.0.1:8080/v1/users/alice/traffic \
 
 ---
 
+## Ограничение трафика (Traffic Limit Policy)
+
+### Обзор
+
+Каждому пользователю можно назначить политику ограничения трафика. Два режима:
+
+| Режим | Поведение |
+|---|---|
+| **Unlimited** (по умолчанию) | Без ограничений по объёму и скорости |
+| **Limited** | Лимит по суммарному трафику (uplink + downlink), после достижения: `throttle` (замедление) или `block` (полная блокировка) |
+
+### Поля политики
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `mode` | `"unlimited"` / `"limited"` | Режим |
+| `traffic_limit_bytes` | integer / null | Лимит в байтах (обязателен для limited) |
+| `post_limit_action` | `"throttle"` / `"block"` / null | Действие после достижения лимита |
+| `throttle_rate_bytes_per_sec` | integer / null | Скорость при throttle (дефолт: 102400 = 100 KB/s) |
+| `enforcement_state` | `"none"` / `"throttled"` / `"blocked"` | Текущее состояние enforcement |
+| `limit_reached_at` | datetime / null | Когда лимит был достигнут |
+| `total_bytes_observed` | integer | Текущий суммарный трафик |
+
+### Throttle vs Block
+
+- **Throttle**: пользователь остаётся подключаемым, но скорость ограничивается до заданного значения (по умолчанию 100 KB/s = 102400 B/s). Реализовано через tc + fwmark на уровне Linux kernel.
+- **Block**: трафик обнуляется полностью через routing в blackhole outbound Xray. Пользователь не удаляется, UUID не меняется — только маршрут трафика.
+
+### Точность лимита
+
+Из-за polling-based архитектуры (каждые 15 секунд) точный hard-cut по байту невозможен. Возможен перелёт лимита на объём трафика за один интервал опроса. Это нормальное ожидаемое ограничение системы.
+
+---
+
+### GET /v1/users/{user_id}/limit-policy
+
+Возвращает текущую политику ограничения трафика пользователя.
+
+```bash
+curl -s http://127.0.0.1:8080/v1/users/alice/limit-policy \
+  -H "Authorization: Bearer $TOKEN" | jq .
+```
+
+Ответ:
+```json
+{
+  "user_id": "alice",
+  "mode": "unlimited",
+  "traffic_limit_bytes": null,
+  "post_limit_action": null,
+  "throttle_rate_bytes_per_sec": null,
+  "enforcement_state": "none",
+  "limit_reached_at": null,
+  "total_bytes_observed": 0
+}
+```
+
+---
+
+### PUT /v1/users/{user_id}/limit-policy
+
+Устанавливает или обновляет политику.
+
+**Unlimited** (снять ограничения):
+```bash
+curl -s -X PUT http://127.0.0.1:8080/v1/users/alice/limit-policy \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"unlimited"}' | jq .
+```
+
+**Limited + throttle** (10 GB, потом 100 KB/s):
+```bash
+curl -s -X PUT http://127.0.0.1:8080/v1/users/alice/limit-policy \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"limited","traffic_limit_bytes":10737418240,"post_limit_action":"throttle","throttle_rate_bytes_per_sec":102400}' | jq .
+```
+
+**Limited + block** (5 GB, потом полная блокировка):
+```bash
+curl -s -X PUT http://127.0.0.1:8080/v1/users/alice/limit-policy \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"limited","traffic_limit_bytes":5368709120,"post_limit_action":"block"}' | jq .
+```
+
+**Правила валидации:**
+- `mode=unlimited`: `traffic_limit_bytes`, `post_limit_action`, `throttle_rate_bytes_per_sec` игнорируются и сбрасываются; `enforcement_state` сбрасывается в `"none"`.
+- `mode=limited`: `traffic_limit_bytes` обязателен и > 0; `post_limit_action` обязателен.
+- `post_limit_action=throttle`: `throttle_rate_bytes_per_sec` обязателен (дефолт 102400).
+- Некорректные комбинации возвращают 422.
+
+---
+
+### Переменные окружения для Traffic Limiting
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `LIMITED_THROTTLE_RATE_BYTES_PER_SEC` | `102400` | Дефолтная скорость throttle (100 KB/s) |
+| `LIMITED_TC_ENABLED` | `true` | Включить tc shaping при bootstrap |
+| `LIMITED_TC_EGRESS_IFACE` | *(авто)* | Егрес-интерфейс (auto-detect если пусто) |
+| `LIMITED_TC_MARK` | `100` | fwmark для throttled пакетов |
+| `LIMITED_TC_CLASS_ID` | `1:10` | tc class id для throttled трафика |
+| `LIMIT_POLL_INTERVAL_SECONDS` | `15` | Интервал enforcement loop |
+
+---
+
+### Troubleshooting
+
+**Проверить tc qdisc:**
+```bash
+tc -s qdisc show dev $(ip route show default | awk '/default/{print $5}')
+tc -s class show dev $(ip route show default | awk '/default/{print $5}')
+tc -s filter show dev $(ip route show default | awk '/default/{print $5}')
+```
+
+**Сбросить tc:**
+```bash
+sudo ./scripts/setup_tc.sh teardown
+```
+
+**Переприменить tc:**
+```bash
+sudo LIMITED_THROTTLE_RATE_BYTES_PER_SEC=102400 ./scripts/setup_tc.sh
+```
+
+**Проверить enforcement rules в Xray config:**
+```bash
+jq '.routing.rules[] | select(.attrs._enforcement)' /usr/local/etc/xray/config.json
+```
+
+**Проверить throttle outbound:**
+```bash
+jq '.outbounds[] | select(.tag=="to-exit-throttled")' /usr/local/etc/xray/config.json
+```
+
+**Логи enforcement:**
+```bash
+journalctl -u bridge-manager --no-pager | grep -E 'limit_reached|throttle_applied|block_applied|enforcement_cleared|policy_changed'
+```
+
+---
+
 ## Проверка цепочки Bridge -> Exit -> Internet
 
 ### Доступность exit
@@ -772,13 +918,22 @@ systemctl restart bridge-manager
     models.py
     auth.py
     settings.py
+    enforcement.py
   scripts/
     bootstrap_bridge.sh
+    setup_tc.sh
     smoke.sh
+  tests/
+    test_api.py
+    test_stats.py
+    test_xray_config.py
+    test_enforcement.py
+    helpers.py
   deploy/
     env.example
   requirements.txt
   README.md
+  IMPLEMENTATION_REPORT.md
 ```
 
 ---

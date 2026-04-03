@@ -1,4 +1,5 @@
 import json
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,11 @@ from .settings import Settings
 
 USER_INBOUND_TAG = "inbound-from-users"
 XRAY_API_READY_PATTERN = "user>>>user:"
+THROTTLE_OUTBOUND_TAG = "to-exit-throttled"
+BLOCKED_OUTBOUND_TAG = "blocked"
+ENFORCEMENT_RULE_PREFIX = "enforcement:"
+
+LOG = logging.getLogger(__name__)
 
 
 class XrayConfigError(RuntimeError):
@@ -212,5 +218,100 @@ def remove_user_client(settings: Settings, user_id: str) -> bool:
         initial_len = len(clients)
         clients[:] = [client for client in clients if client.get("email") != email]
         return len(clients) != initial_len
+
+    return _apply_mutation(settings, mutate)
+
+
+def _ensure_throttle_outbound(config: dict, settings: Settings) -> None:
+    outbounds = config.setdefault("outbounds", [])
+    for ob in outbounds:
+        if ob.get("tag") == THROTTLE_OUTBOUND_TAG:
+            ss = ob.setdefault("streamSettings", {})
+            ss.setdefault("sockopt", {})["mark"] = settings.limited_tc_mark
+            return
+
+    exit_ob = None
+    for ob in outbounds:
+        if ob.get("tag") == "to-exit":
+            exit_ob = ob
+            break
+
+    if exit_ob is None:
+        raise XrayConfigError("Outbound 'to-exit' not found; cannot create throttle outbound")
+
+    import copy
+    throttle_ob = copy.deepcopy(exit_ob)
+    throttle_ob["tag"] = THROTTLE_OUTBOUND_TAG
+    ss = throttle_ob.setdefault("streamSettings", {})
+    ss.setdefault("sockopt", {})["mark"] = settings.limited_tc_mark
+    outbounds.append(throttle_ob)
+
+
+def _ensure_blocked_outbound(config: dict) -> None:
+    outbounds = config.setdefault("outbounds", [])
+    for ob in outbounds:
+        if ob.get("tag") == BLOCKED_OUTBOUND_TAG:
+            return
+    outbounds.append({"protocol": "blackhole", "tag": BLOCKED_OUTBOUND_TAG, "settings": {}})
+
+
+def _is_enforcement_rule(rule: dict) -> bool:
+    return isinstance(rule.get("attrs", {}).get("_enforcement"), bool)
+
+
+def apply_enforcement_routing(
+    settings: Settings,
+    throttled_user_ids: list[str],
+    blocked_user_ids: list[str],
+) -> bool:
+    throttled_emails = [f"user:{uid}" for uid in throttled_user_ids]
+    blocked_emails = [f"user:{uid}" for uid in blocked_user_ids]
+
+    def mutate(config: dict) -> bool:
+        _ensure_throttle_outbound(config, settings)
+        _ensure_blocked_outbound(config)
+
+        routing = config.setdefault("routing", {})
+        rules = routing.setdefault("rules", [])
+
+        old_enforcement = [r for r in rules if _is_enforcement_rule(r)]
+        rules[:] = [r for r in rules if not _is_enforcement_rule(r)]
+
+        new_enforcement: list[dict] = []
+
+        if blocked_emails:
+            new_enforcement.append({
+                "type": "field",
+                "user": blocked_emails,
+                "inboundTag": [USER_INBOUND_TAG],
+                "outboundTag": BLOCKED_OUTBOUND_TAG,
+                "attrs": {"_enforcement": True},
+            })
+
+        if throttled_emails:
+            new_enforcement.append({
+                "type": "field",
+                "user": throttled_emails,
+                "inboundTag": [USER_INBOUND_TAG],
+                "outboundTag": THROTTLE_OUTBOUND_TAG,
+                "attrs": {"_enforcement": True},
+            })
+
+        api_rule_idx = None
+        for i, r in enumerate(rules):
+            if r.get("outboundTag") == "api":
+                api_rule_idx = i
+                break
+
+        insert_at = (api_rule_idx + 1) if api_rule_idx is not None else 0
+        for j, er in enumerate(new_enforcement):
+            rules.insert(insert_at + j, er)
+
+        if len(new_enforcement) != len(old_enforcement):
+            return True
+        for new_r, old_r in zip(new_enforcement, old_enforcement):
+            if new_r.get("user") != old_r.get("user") or new_r.get("outboundTag") != old_r.get("outboundTag"):
+                return True
+        return False
 
     return _apply_mutation(settings, mutate)

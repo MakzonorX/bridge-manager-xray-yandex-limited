@@ -30,6 +30,13 @@ class Settings(BaseSettings):
 
     db_path: str = "/opt/bridge-manager/data/bridge_manager.db"
 
+    limited_throttle_rate_bytes_per_sec: int = 102400
+    limited_tc_enabled: bool = True
+    limited_tc_egress_iface: str = ""
+    limited_tc_mark: int = 100
+    limited_tc_class_id: str = "1:10"
+    limit_poll_interval_seconds: int = 15
+
     model_config = SettingsConfigDict(
         env_file="/etc/bridge-manager/env",
         env_file_encoding="utf-8",

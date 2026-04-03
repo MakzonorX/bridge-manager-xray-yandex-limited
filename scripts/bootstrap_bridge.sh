@@ -83,7 +83,7 @@ require_vars() {
 setup_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y curl socat cron unzip openssl dnsutils net-tools jq git ufw ca-certificates python3 python3-venv python3-pip rsync
+  apt-get install -y curl socat cron unzip openssl dnsutils net-tools jq git ufw ca-certificates python3 python3-venv python3-pip rsync iproute2
 }
 
 setup_time_and_sysctl() {
@@ -479,6 +479,22 @@ activate_xray() {
   systemctl enable --now xray
 }
 
+setup_traffic_shaping() {
+  if [[ "${LIMITED_TC_ENABLED}" != "true" ]]; then
+    echo "tc: traffic shaping disabled (LIMITED_TC_ENABLED!=true)"
+    return
+  fi
+
+  local repo_root
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+  LIMITED_TC_EGRESS_IFACE="${LIMITED_TC_EGRESS_IFACE}" \
+  LIMITED_TC_MARK="${LIMITED_TC_MARK}" \
+  LIMITED_TC_CLASS_ID="${LIMITED_TC_CLASS_ID}" \
+  LIMITED_THROTTLE_RATE_BYTES_PER_SEC="${LIMITED_THROTTLE_RATE_BYTES_PER_SEC}" \
+    bash "${repo_root}/scripts/setup_tc.sh"
+}
+
 sync_app_code() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -538,6 +554,12 @@ API_TOKEN=${API_TOKEN}
 API_BIND=${api_bind}
 API_PORT=8080
 DB_PATH=/opt/bridge-manager/data/bridge_manager.db
+LIMITED_THROTTLE_RATE_BYTES_PER_SEC=${LIMITED_THROTTLE_RATE_BYTES_PER_SEC}
+LIMITED_TC_ENABLED=${LIMITED_TC_ENABLED}
+LIMITED_TC_EGRESS_IFACE=${LIMITED_TC_EGRESS_IFACE}
+LIMITED_TC_MARK=${LIMITED_TC_MARK}
+LIMITED_TC_CLASS_ID=${LIMITED_TC_CLASS_ID}
+LIMIT_POLL_INTERVAL_SECONDS=${LIMIT_POLL_INTERVAL_SECONDS}
 EOF_ENV
   chmod 600 "${APP_ENV_FILE}"
 }
@@ -598,6 +620,13 @@ main() {
   EXIT_SERVER_NAME="${EXIT_SERVER_NAME:-${EXIT_HOST}}"
   BRIDGE_UUID_FOR_EXIT="${BRIDGE_UUID_FOR_EXIT:-${_DEFAULT_BRIDGE_UUID_FOR_EXIT}}"
 
+  LIMITED_THROTTLE_RATE_BYTES_PER_SEC="${LIMITED_THROTTLE_RATE_BYTES_PER_SEC:-102400}"
+  LIMITED_TC_ENABLED="${LIMITED_TC_ENABLED:-true}"
+  LIMITED_TC_EGRESS_IFACE="${LIMITED_TC_EGRESS_IFACE:-}"
+  LIMITED_TC_MARK="${LIMITED_TC_MARK:-100}"
+  LIMITED_TC_CLASS_ID="${LIMITED_TC_CLASS_ID:-1:10}"
+  LIMIT_POLL_INTERVAL_SECONDS="${LIMIT_POLL_INTERVAL_SECONDS:-15}"
+
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 0
@@ -624,6 +653,8 @@ main() {
   prepare_reality_materials
   write_xray_config
   activate_xray
+
+  setup_traffic_shaping
 
   sync_app_code
   install_app_venv

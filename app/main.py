@@ -1,27 +1,63 @@
 from datetime import datetime, timezone
+from typing import Literal, Optional
 from uuid import uuid4
 from urllib.parse import quote
 import logging
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
-from .models import User
+from .enforcement import (
+    EnforcementLoop,
+    check_and_enforce_limits,
+    clear_enforcement,
+    get_or_create_policy,
+    reapply_enforcement_routing,
+)
+from .models import User, UserLimitPolicy, UserTraffic
 from .settings import Settings, get_settings
 from .stats import TrafficCollector, get_user_traffic, persist_all_user_runtime_totals, traffic_state_guard
 from .storage import get_session, init_db
 from .xray_config import XrayConfigError, remove_user_client, upsert_user_client
 
-app = FastAPI(title="Bridge Manager", version="1.0.0")
+app = FastAPI(title="Bridge Manager", version="1.1.0")
 LOG = logging.getLogger(__name__)
 traffic_collector: TrafficCollector | None = None
+enforcement_loop: EnforcementLoop | None = None
 
 
 class CreateUserRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=128)
     label: str | None = Field(default=None, max_length=255)
+
+
+class LimitPolicyRequest(BaseModel):
+    mode: Literal["unlimited", "limited"]
+    traffic_limit_bytes: Optional[int] = None
+    post_limit_action: Optional[Literal["throttle", "block"]] = None
+    throttle_rate_bytes_per_sec: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+        if self.mode == "unlimited":
+            self.traffic_limit_bytes = None
+            self.post_limit_action = None
+            self.throttle_rate_bytes_per_sec = None
+        elif self.mode == "limited":
+            if self.traffic_limit_bytes is None or self.traffic_limit_bytes <= 0:
+                raise ValueError("traffic_limit_bytes must be > 0 for limited mode")
+            if self.post_limit_action is None:
+                raise ValueError("post_limit_action is required for limited mode")
+            if self.post_limit_action == "throttle":
+                if self.throttle_rate_bytes_per_sec is None:
+                    self.throttle_rate_bytes_per_sec = 102400
+                if self.throttle_rate_bytes_per_sec <= 0:
+                    raise ValueError("throttle_rate_bytes_per_sec must be > 0")
+            else:
+                self.throttle_rate_bytes_per_sec = None
+        return self
 
 
 def _build_vless_uri(settings: Settings, user_uuid: str, user_id: str, label: str | None) -> str:
@@ -66,7 +102,42 @@ def _serialize_user(settings: Settings, user: User) -> dict:
             "flow": settings.user_flow,
             "fingerprint": settings.reality_fingerprint,
         }
+
+    session = get_session()
+    try:
+        policy = session.get(UserLimitPolicy, user.user_id)
+        if policy is not None:
+            payload["limit_policy"] = _serialize_policy(policy, session)
+        else:
+            payload["limit_policy"] = {
+                "mode": "unlimited",
+                "traffic_limit_bytes": None,
+                "post_limit_action": None,
+                "throttle_rate_bytes_per_sec": None,
+                "enforcement_state": "none",
+                "limit_reached_at": None,
+                "total_bytes_observed": 0,
+            }
+    finally:
+        session.close()
     return payload
+
+
+def _serialize_policy(policy: UserLimitPolicy, session) -> dict:
+    traffic = session.get(UserTraffic, policy.user_id)
+    total_bytes = 0
+    if traffic is not None:
+        total_bytes = traffic.total_uplink + traffic.total_downlink
+
+    return {
+        "mode": policy.mode,
+        "traffic_limit_bytes": policy.traffic_limit_bytes,
+        "post_limit_action": policy.post_limit_action,
+        "throttle_rate_bytes_per_sec": policy.throttle_rate_bytes_per_sec,
+        "enforcement_state": policy.enforcement_state,
+        "limit_reached_at": policy.limit_reached_at.isoformat() if policy.limit_reached_at else None,
+        "total_bytes_observed": total_bytes,
+    }
 
 
 def _xray_is_active(service_name: str) -> bool:
@@ -87,16 +158,21 @@ def _xray_listens_port(port: int) -> bool:
 
 @app.on_event("startup")
 def startup() -> None:
-    global traffic_collector
+    global traffic_collector, enforcement_loop
     init_db()
     settings = get_settings()
-    traffic_collector = TrafficCollector(settings=settings, interval_seconds=15)
+    traffic_collector = TrafficCollector(settings=settings, interval_seconds=settings.limit_poll_interval_seconds)
     traffic_collector.start()
+    enforcement_loop = EnforcementLoop(settings=settings, interval_seconds=settings.limit_poll_interval_seconds)
+    enforcement_loop.start()
 
 
 @app.on_event("shutdown")
 def shutdown() -> None:
-    global traffic_collector
+    global traffic_collector, enforcement_loop
+    if enforcement_loop is not None:
+        enforcement_loop.stop()
+        enforcement_loop = None
     if traffic_collector is not None:
         traffic_collector.stop()
         traffic_collector = None
@@ -233,3 +309,96 @@ def user_traffic(
 
     traffic = get_user_traffic(settings, user_id)
     return {"user_id": user_id, **traffic}
+
+
+@app.get("/v1/users/{user_id}/limit-policy")
+def get_limit_policy(
+    user_id: str,
+    _: None = Depends(require_token),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    session = get_session()
+    try:
+        user = session.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        policy = session.get(UserLimitPolicy, user_id)
+        if policy is None:
+            traffic = session.get(UserTraffic, user_id)
+            total_bytes = (traffic.total_uplink + traffic.total_downlink) if traffic else 0
+            return {
+                "user_id": user_id,
+                "mode": "unlimited",
+                "traffic_limit_bytes": None,
+                "post_limit_action": None,
+                "throttle_rate_bytes_per_sec": None,
+                "enforcement_state": "none",
+                "limit_reached_at": None,
+                "total_bytes_observed": total_bytes,
+            }
+
+        return {"user_id": user_id, **_serialize_policy(policy, session)}
+    finally:
+        session.close()
+
+
+@app.put("/v1/users/{user_id}/limit-policy")
+def set_limit_policy(
+    user_id: str,
+    payload: LimitPolicyRequest,
+    _: None = Depends(require_token),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    session = get_session()
+    try:
+        user = session.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        policy = session.get(UserLimitPolicy, user_id)
+        if policy is None:
+            policy = UserLimitPolicy(
+                user_id=user_id,
+                mode="unlimited",
+                enforcement_state="none",
+                throttle_rate_bytes_per_sec=settings.limited_throttle_rate_bytes_per_sec,
+            )
+
+        old_mode = policy.mode
+        old_enforcement = policy.enforcement_state
+
+        policy.mode = payload.mode
+        policy.traffic_limit_bytes = payload.traffic_limit_bytes
+        policy.post_limit_action = payload.post_limit_action
+        if payload.throttle_rate_bytes_per_sec is not None:
+            policy.throttle_rate_bytes_per_sec = payload.throttle_rate_bytes_per_sec
+        elif payload.mode == "limited" and payload.post_limit_action == "throttle":
+            policy.throttle_rate_bytes_per_sec = settings.limited_throttle_rate_bytes_per_sec
+
+        need_clear = False
+        if payload.mode == "unlimited" and old_enforcement != "none":
+            policy.enforcement_state = "none"
+            policy.limit_reached_at = None
+            policy.last_enforced_at = None
+            need_clear = True
+
+        session.add(policy)
+        session.commit()
+        session.refresh(policy)
+
+        LOG.info("policy_changed user_id=%s old_mode=%s new_mode=%s old_enforcement=%s new_enforcement=%s",
+                 user_id, old_mode, payload.mode, old_enforcement, policy.enforcement_state)
+
+        if need_clear:
+            try:
+                reapply_enforcement_routing(settings)
+                LOG.info("enforcement_cleared user_id=%s", user_id)
+            except Exception as exc:
+                LOG.warning("enforcement clear xray reload failed: %s", exc)
+
+        result = {"user_id": user_id, **_serialize_policy(policy, session)}
+    finally:
+        session.close()
+
+    return result
