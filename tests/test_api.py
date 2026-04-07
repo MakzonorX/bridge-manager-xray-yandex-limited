@@ -134,3 +134,62 @@ class ApiTrafficGuardTests(unittest.TestCase):
                 "runtime_downlink_bytes": 4,
             },
         )
+
+    def test_healthz_returns_plain_ok_when_checks_pass(self) -> None:
+        with mock.patch("app.main._collect_health_checks", return_value={"xray_active": True, "xray_listening_user_port": True}):
+            response = main.healthz(self.settings)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b"OK")
+
+    def test_system_diagnostics_exposes_effective_reality_profile(self) -> None:
+        settings = self.settings.model_copy(
+            update={
+                "api_public": True,
+                "api_allow_from": "198.51.100.10,198.51.100.0/24",
+                "reality_profile": "auto_ru",
+                "reality_effective_profile": "max_ru",
+                "reality_profile_source": "profile:auto_ru->max_ru",
+                "reality_server_name": "max.ru",
+                "reality_dest": "max.ru:443",
+                "reality_public_key": "pubkey",
+                "reality_short_id": "deadbeef",
+                "exit_host": "exit.example.com",
+                "exit_port": 443,
+                "bridge_uuid_for_exit": "11111111-1111-1111-1111-111111111111",
+            }
+        )
+
+        with mock.patch("app.main._collect_health_checks", return_value={"xray_active": True}), mock.patch(
+            "app.main._get_tc_diagnostics",
+            return_value={
+                "enabled": True,
+                "service_state": "active",
+                "iface": "eth0",
+                "mark": 100,
+                "class_id": "1:10",
+                "qdisc_present": True,
+                "filter_present": True,
+            },
+        ), mock.patch(
+            "app.main._get_ufw_diagnostics",
+            return_value={
+                "ufw_active": True,
+                "status_line": "Status: active",
+                "api_exposure": "allow-listed",
+                "api_allow_from": ["198.51.100.10", "198.51.100.0/24"],
+            },
+        ), mock.patch("app.main._check_tcp_connectivity", return_value=True), mock.patch(
+            "app.main._service_state",
+            side_effect=["active", "active", "active"],
+        ), mock.patch("app.main._xray_listens_port", return_value=True):
+            payload = main.system_diagnostics(None, settings)
+
+        self.assertEqual(payload["health"]["status"], "ok")
+        self.assertEqual(payload["api"]["allow_from"], ["198.51.100.10", "198.51.100.0/24"])
+        self.assertEqual(payload["reality"]["profile"], "auto_ru")
+        self.assertEqual(payload["reality"]["effective_profile"], "max_ru")
+        self.assertEqual(payload["reality"]["profile_source"], "profile:auto_ru->max_ru")
+        self.assertEqual(payload["reality"]["server_name"], "max.ru")
+        self.assertTrue(payload["exit"]["reachable_tcp"])
+        self.assertEqual(payload["services"]["tc"]["state"], "active")

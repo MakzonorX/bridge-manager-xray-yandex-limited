@@ -3,7 +3,7 @@
 # Uses fwmark-based classification to rate-limit packets from Xray's
 # throttle outbound (marked with SO_MARK).
 #
-# Usage: sudo ./scripts/setup_tc.sh [teardown]
+# Usage: sudo ./scripts/setup_tc.sh [teardown|status]
 #
 # Env vars (all optional, sane defaults provided):
 #   LIMITED_TC_EGRESS_IFACE  - egress interface (auto-detected if empty)
@@ -36,6 +36,15 @@ teardown_tc() {
   # Remove existing htb qdisc if present (ignore errors)
   tc qdisc del dev "${iface}" root 2>/dev/null || true
   echo "tc: cleared qdisc on ${iface}"
+}
+
+status_tc() {
+  local iface="$1"
+
+  echo "tc: interface=${iface}"
+  tc qdisc show dev "${iface}" || true
+  tc class show dev "${iface}" || true
+  tc filter show dev "${iface}" parent 1: || true
 }
 
 setup_tc() {
@@ -80,6 +89,11 @@ main() {
 
   if [[ "${1:-}" == "teardown" ]]; then
     teardown_tc "${iface}"
+    exit 0
+  fi
+
+  if [[ "${1:-}" == "status" ]]; then
+    status_tc "${iface}"
     exit 0
   fi
 

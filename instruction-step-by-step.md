@@ -19,6 +19,8 @@
 - `GET /v1/users/{user_id}/traffic`
 - `DELETE /v1/users/{user_id}`
 - `GET /health`
+- `GET /healthz`
+- `GET /v1/system/diagnostics`
 5. **Ограничение трафика по ключу**: для каждого пользователя можно задать лимит трафика.
 - `GET /v1/users/{user_id}/limit-policy` — текущая политика
 - `PUT /v1/users/{user_id}/limit-policy` — установить/обновить политику
@@ -60,6 +62,8 @@
 Прочее опциональное:
 
 10. `API_PUBLIC`
+11. `API_ALLOW_FROM` — список IP/CIDR через запятую, если нужно открыть `8080/tcp` не всем
+12. `REALITY_PROFILE` — preset для новых REALITY-нод (`legacy_x5`, `max_ru`, `mail_ru`, `vk_com`, `auto_ru`)
 
 ---
 
@@ -92,7 +96,7 @@ dig +short A <BRIDGE_DOMAIN>
 Рекомендуемый путь:
 
 ```bash
-sudo git clone https://github.com/MakzonorX/bridge-manager-xray.git /opt/bridge-manager
+sudo git clone https://github.com/MakzonorX/bridge-manager-xray-yandex-limited.git /opt/bridge-manager
 cd /opt/bridge-manager
 ```
 
@@ -124,10 +128,30 @@ API_TOKEN='<ВАШ_ТОКЕН>' \
 sudo BRIDGE_DOMAIN='bridge.example.com' \
 API_TOKEN='super_secret_token_value' \
 API_PUBLIC=true \
+API_ALLOW_FROM='198.51.100.10,198.51.100.0/24' \
 USER_MODE=reality \
 USER_PORT=443 \
 USER_FLOW=xtls-rprx-vision \
-REALITY_SERVER_NAME='ads.x5.ru' \
+REALITY_PROFILE='auto_ru' \
+EXIT_HOST='s1.bytestand.fun' \
+EXIT_PORT=443 \
+EXIT_PATH='/bridge-xh' \
+EXIT_SERVER_NAME='s1.bytestand.fun' \
+BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
+DISABLE_IPV6=true \
+./scripts/bootstrap_bridge.sh
+```
+
+Если нужен полностью ручной REALITY-профиль без preset, задайте `REALITY_SERVER_NAME` и `REALITY_DEST` явно:
+
+```bash
+sudo BRIDGE_DOMAIN='bridge.example.com' \
+API_TOKEN='super_secret_token_value' \
+API_PUBLIC=true \
+USER_MODE=reality \
+USER_PORT=443 \
+REALITY_SERVER_NAME='max.ru' \
+REALITY_DEST='max.ru:443' \
 EXIT_HOST='s1.bytestand.fun' \
 EXIT_PORT=443 \
 EXIT_PATH='/bridge-xh' \
@@ -168,14 +192,17 @@ DISABLE_IPV6=true \
 
 1. Устанавливает системные пакеты.
 2. Включает синхронизацию времени.
-3. Настраивает UFW (`22`, `80`, `443`, и `8080` если `API_PUBLIC=true`).
+3. Настраивает UFW (`22`, user-port, `80` только при `USER_MODE=xhttp`, `8080` только если `API_PUBLIC=true`, при необходимости через `API_ALLOW_FROM`).
 4. Ставит Xray `v26.2.6`.
 5. *(Только `USER_MODE=xhttp`)* Выпускает TLS-сертификат через acme.sh standalone (`:80`).
-6. Пишет Xray-конфиг bridge (в соответствии с выбранным режимом).
-7. Включает и стартует `xray.service`.
-8. Создаёт Python venv, ставит зависимости Bridge Manager.
-9. Пишет `/etc/bridge-manager/env`.
-10. Включает и стартует `bridge-manager.service`.
+6. Для `USER_MODE=reality` либо применяет preset (`REALITY_PROFILE`), либо использует явные `REALITY_SERVER_NAME` / `REALITY_DEST`.
+7. Переиспользует существующие REALITY keys / short-id / exit settings при повторном bootstrap, если вы не переопределили их явно.
+8. Пишет Xray-конфиг bridge.
+9. Включает и стартует `xray.service`.
+10. Создаёт Python venv, ставит зависимости Bridge Manager.
+11. Пишет `/etc/bridge-manager/env`.
+12. Включает и стартует `bridge-manager.service`.
+13. Включает `bridge-manager-tc.service`, чтобы shaping переживал reboot.
 
 ---
 
@@ -186,9 +213,10 @@ DISABLE_IPV6=true \
 ```bash
 systemctl is-active xray
 systemctl is-active bridge-manager
+systemctl is-active bridge-manager-tc
 ```
 
-Оба должны вернуть `active`.
+`xray` и `bridge-manager` должны вернуть `active`. `bridge-manager-tc` тоже должен быть `active`, если `LIMITED_TC_ENABLED=true`.
 
 Проверьте порты:
 
@@ -205,7 +233,22 @@ ss -lntp | egrep '(:443|:1080|:10085|:8080)\s'
 
 ---
 
-## 6) Проверка TLS на bridge-домене
+## 6) Проверка транспорта на bridge
+
+### Для USER_MODE=reality
+
+```bash
+curl -s http://127.0.0.1:8080/health | jq .
+curl -s http://127.0.0.1:8080/healthz
+curl -s -H "Authorization: Bearer <API_TOKEN>" http://127.0.0.1:8080/v1/system/diagnostics | jq .
+```
+
+Ожидание:
+- `/health` возвращает `status=ok`
+- `/healthz` возвращает `OK`
+- в diagnostics есть корректные `reality.profile`, `reality.server_name`, `reality.dest`
+
+### Для USER_MODE=xhttp
 
 ```bash
 echo | openssl s_client -connect <BRIDGE_DOMAIN>:443 -servername <BRIDGE_DOMAIN> 2>/dev/null | openssl x509 -noout -subject -issuer -dates
@@ -224,10 +267,14 @@ echo | openssl s_client -connect <BRIDGE_DOMAIN>:443 -servername <BRIDGE_DOMAIN>
 
 ```bash
 curl -s http://127.0.0.1:8080/health | jq .
+curl -s http://127.0.0.1:8080/healthz
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/system/diagnostics | jq .
 ```
 
 Ожидание:
 - `status: "ok"`
+- `/healthz` возвращает `OK`
+- diagnostics показывает effective transport/profile/firewall/tc состояние
 
 ### 7.2 Создать пользователя
 
@@ -245,6 +292,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/users \
 - Формат URI:
 
 ```text
+USER_MODE=reality:
+vless://UUID@BRIDGE_DOMAIN:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=<REALITY_SERVER_NAME>&fp=chrome&pbk=<REALITY_PUBLIC_KEY>&sid=<REALITY_SHORT_ID>&type=tcp&spx=%2F#label
+
+USER_MODE=xhttp:
 vless://UUID@BRIDGE_DOMAIN:443?encryption=none&security=tls&sni=BRIDGE_DOMAIN&type=xhttp&path=%2Fuser-xh#label
 ```
 
@@ -434,6 +485,7 @@ systemctl restart bridge-manager
 ```bash
 journalctl -u xray -f
 journalctl -u bridge-manager -f
+journalctl -u bridge-manager-tc -f
 ```
 
 Статус сервисов:
@@ -441,6 +493,7 @@ journalctl -u bridge-manager -f
 ```bash
 systemctl status xray --no-pager
 systemctl status bridge-manager --no-pager
+systemctl status bridge-manager-tc --no-pager
 ```
 
 Проверка валидности Xray конфигурации:
@@ -458,8 +511,7 @@ journalctl -u bridge-manager --no-pager | grep -E 'policy_changed|limit_reached|
 Проверка tc shaping:
 
 ```bash
-tc -s qdisc show dev $(ip route show default | awk '/default/{print $5}')
-tc -s class show dev $(ip route show default | awk '/default/{print $5}')
+sudo /opt/bridge-manager/scripts/setup_tc.sh status
 ```
 
 Проверка enforcement rules в Xray config:

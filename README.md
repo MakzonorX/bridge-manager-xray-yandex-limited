@@ -4,7 +4,7 @@
 
 Готовое решение для схемы:
 
-1. Клиент -> Bridge: `VLESS + XHTTP + TLS` на `:443`, `path=/user-xh`
+1. Клиент -> Bridge: по умолчанию `VLESS + REALITY` на `:443`; опционально `VLESS + XHTTP + TLS`
 2. Bridge -> Exit: `VLESS + XHTTP + TLS` на `s1.bytestand.fun:443`, `path=/bridge-xh`
 3. Bridge Manager (FastAPI): выпуск/удаление ключей, хранение в SQLite, управление users в inbound Xray.
 
@@ -12,6 +12,7 @@
 - На exit-node ничего не меняется.
 - Xray работает на хосте через systemd (не docker).
 - REST API по умолчанию слушает только `127.0.0.1:8080`.
+- Для новых REALITY-нод можно использовать preset через `REALITY_PROFILE`, не меняя старый дефолт.
 
 ---
 
@@ -49,7 +50,7 @@
 ### 1. Клонировать репозиторий
 
 ```bash
-sudo git clone <PRIVATE_REPO_URL> /opt/bridge-manager
+sudo git clone https://github.com/MakzonorX/bridge-manager-xray-yandex-limited.git /opt/bridge-manager
 cd /opt/bridge-manager
 ```
 
@@ -63,7 +64,24 @@ API_TOKEN='очень_длинный_секрет' \
 ./scripts/bootstrap_bridge.sh
 ```
 
-Полная команда — все параметры явно, API открыт наружу, протокол клиент→bridge = xhttp, кастомный exit-node:
+Рекомендуемый запуск для новой REALITY-ноды: профиль выбирается через preset, а API можно открыть только для нужных IP/CIDR:
+
+```bash
+sudo BRIDGE_DOMAIN='bridge.example.com' \
+API_TOKEN='очень_длинный_секрет' \
+API_PUBLIC=true \
+API_ALLOW_FROM='198.51.100.10,198.51.100.0/24' \
+USER_MODE=reality \
+USER_PORT=443 \
+REALITY_PROFILE=auto_ru \
+EXIT_HOST='s1.bytestand.fun' \
+EXIT_PORT=443 \
+EXIT_PATH='/bridge-xh' \
+BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
+./scripts/bootstrap_bridge.sh
+```
+
+Полная команда для `USER_MODE=xhttp`, API открыт наружу, кастомный exit-node:
 
 ```bash
 sudo BRIDGE_DOMAIN='bridge.example.com' \
@@ -81,7 +99,7 @@ BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
 ./scripts/bootstrap_bridge.sh
 ```
 
-То же, но с режимом REALITY (без ACME, без TLS-сертификата на bridge):
+То же, но с режимом REALITY и явным custom override без preset:
 
 ```bash
 sudo BRIDGE_DOMAIN='bridge.example.com' \
@@ -90,6 +108,7 @@ API_PUBLIC=true \
 USER_MODE=reality \
 USER_PORT=443 \
 REALITY_SERVER_NAME='ads.x5.ru' \
+REALITY_DEST='ads.x5.ru:443' \
 EXIT_HOST='s1.bytestand.fun' \
 EXIT_PORT=443 \
 EXIT_PATH='/bridge-xh' \
@@ -103,14 +122,15 @@ BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
 
 1. Ставит зависимости (`curl`, `ufw`, `python3-venv`, и т.д.).
 2. Включает time sync.
-3. Настраивает firewall (`22/80/443`, а `8080` только если `API_PUBLIC=true`).
+3. Настраивает firewall (`22` и user-port; `80` только при `USER_MODE=xhttp`; `8080` только если `API_PUBLIC=true`, при необходимости с allow-list через `API_ALLOW_FROM`).
 4. Ставит Xray `v26.2.6` в `/usr/local/bin/xray`.
 5. *(Только `USER_MODE=xhttp`)* Выпускает Let's Encrypt сертификат через `acme.sh` (standalone).
-6. Пишет Xray-конфиг bridge в `/usr/local/etc/xray/config.json` (в соответствии с `USER_MODE`).
-7. Поднимает `xray.service`.
-8. Ставит Python venv и зависимости Bridge Manager.
-9. Пишет env-файл `/etc/bridge-manager/env`.
-10. Поднимает `bridge-manager.service`.
+6. Для `USER_MODE=reality` вычисляет effective profile (`REALITY_PROFILE`) либо принимает явные `REALITY_SERVER_NAME` / `REALITY_DEST`.
+7. Пишет Xray-конфиг bridge в `/usr/local/etc/xray/config.json` (в соответствии с `USER_MODE`).
+8. Сохраняет effective env в `/etc/bridge-manager/env`, чтобы повторный bootstrap не регенерировал ключи/short-id без необходимости.
+9. Поднимает `xray.service` и `bridge-manager.service`.
+10. Поднимает `bridge-manager-tc.service`, чтобы tc shaping переживал reboot.
+11. Включает `/healthz` и `GET /v1/system/diagnostics` для быстрой проверки effective profile/firewall/tc.
 
 ---
 
@@ -138,13 +158,19 @@ BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `REALITY_SERVER_NAME` | `ads.x5.ru` | SNI и serverName для REALITY |
-| `REALITY_DEST` | `REALITY_SERVER_NAME:443` | Реальный бэкенд для REALITY |
+| `REALITY_PROFILE` | `legacy_x5` | Preset для новых нод: `legacy_x5`, `max_ru`, `mail_ru`, `vk_com`, `auto_ru` |
+| `REALITY_SERVER_NAME` | из `REALITY_PROFILE` | Явный SNI/serverName. Имеет приоритет над preset |
+| `REALITY_DEST` | `REALITY_SERVER_NAME:443` | Явный dest. Имеет приоритет над preset |
 | `REALITY_SHORT_ID` | *(случайный hex)* | Short ID REALITY |
-| `REALITY_PRIVATE_KEY` | *(генерируется)* | x25519 private key |
+| `REALITY_PRIVATE_KEY` | *(генерируется или переиспользуется)* | x25519 private key |
 | `REALITY_PUBLIC_KEY` | *(выводится из private)* | x25519 public key |
 | `REALITY_FINGERPRINT` | `chrome` | TLS fingerprint |
 | `REALITY_SPIDER_X` | `/` | spiderX |
+
+Рекомендуемая практика:
+- Для старого поведения ничего не указывать: останется `legacy_x5`.
+- Для новых bridge-нод использовать `REALITY_PROFILE=max_ru` или `REALITY_PROFILE=auto_ru`.
+- Если нужен полностью ручной профиль, задавайте сразу `REALITY_SERVER_NAME` и `REALITY_DEST`.
 
 ### Параметры exit-node (bridge → exit)
 
@@ -161,6 +187,7 @@ BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `API_PUBLIC` | `false` | `true` → API на `0.0.0.0:8080`, UFW открывает порт |
+| `API_ALLOW_FROM` | пусто | Список IP/CIDR через запятую для UFW на `8080/tcp`, если `API_PUBLIC=true` |
 | `DISABLE_IPV6` | `true` | Отключить IPv6 через sysctl |
 
 ---
@@ -172,9 +199,10 @@ BRIDGE_UUID_FOR_EXIT='7d28c9a1-e5f3-4b90-8a2f-d3e4b7c9f8a0' \
 ```bash
 systemctl is-active xray
 systemctl is-active bridge-manager
+systemctl is-active bridge-manager-tc
 ```
 
-Ожидается: оба `active`.
+Ожидается: все нужные сервисы `active` (`bridge-manager-tc` только если `LIMITED_TC_ENABLED=true`).
 
 ### 2. Порты
 
@@ -193,6 +221,9 @@ ss -lntp | egrep '(:443|:1080|:10085|:8080)\s'
 
 ```bash
 curl -s http://127.0.0.1:8080/health | jq .
+curl -s http://127.0.0.1:8080/healthz
+curl -s -H "Authorization: Bearer <API_TOKEN>" http://127.0.0.1:8080/v1/system/diagnostics | jq .
+sudo /opt/bridge-manager/scripts/setup_tc.sh status
 ```
 
 ---
@@ -206,6 +237,8 @@ curl -s http://127.0.0.1:8080/health | jq .
 
 **Доступные эндпоинты:**
 - `GET /health` — проверка состояния сервиса (без авторизации)
+- `GET /healthz` — короткий plain-text healthcheck (без авторизации)
+- `GET /v1/system/diagnostics` — effective transport/profile/firewall/tc статус (с авторизацией)
 - `POST /v1/users` — создание/восстановление пользователя
 - `GET /v1/users/{user_id}` — получение информации о пользователе
 - `GET /v1/users/{user_id}/traffic` — получение статистики трафика пользователя
@@ -216,7 +249,7 @@ curl -s http://127.0.0.1:8080/health | jq .
 **Авторизация:**
 - Все эндпоинты `/v1/*` требуют HTTP-заголовок: `Authorization: Bearer <API_TOKEN>`
 - Токен задаётся через переменную `API_TOKEN` при установке или в `/etc/bridge-manager/env`
-- Эндпоинт `/health` доступен без авторизации
+- Эндпоинты `/health` и `/healthz` доступны без авторизации
 
 ---
 
