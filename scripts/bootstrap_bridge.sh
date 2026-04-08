@@ -140,6 +140,22 @@ inherit_from_xray_config_if_empty() {
   fi
 }
 
+sync_from_xray_config_unless_explicit() {
+  local var_name="$1"
+  local jq_expr="$2"
+  local explicit_flag="$3"
+  local existing_value
+
+  if [[ "${explicit_flag}" == "true" ]]; then
+    return
+  fi
+
+  existing_value="$(parse_xray_config_value "${jq_expr}" || true)"
+  if [[ -n "${existing_value}" ]]; then
+    printf -v "${var_name}" '%s' "${existing_value}"
+  fi
+}
+
 resolve_reality_profile_defaults() {
   local profile="$1"
 
@@ -347,11 +363,13 @@ prepare_reality_materials() {
     REALITY_PRIVATE_KEY="$(echo "${out}" | awk -F': ' '/PrivateKey/{print $2; exit}')"
     REALITY_PUBLIC_KEY="$(echo "${out}" | awk -F': ' '/PublicKey|Password/{print $2; exit}')"
   else
-    local out
+    local out derived_public_key
     out="$("${XRAY_BIN}" x25519 -i "${REALITY_PRIVATE_KEY}")"
-    if [[ -z "${REALITY_PUBLIC_KEY}" ]]; then
-      REALITY_PUBLIC_KEY="$(echo "${out}" | awk -F': ' '/PublicKey|Password/{print $2; exit}')"
+    derived_public_key="$(echo "${out}" | awk -F': ' '/PublicKey|Password/{print $2; exit}')"
+    if [[ -n "${REALITY_PUBLIC_KEY}" && "${REALITY_PUBLIC_KEY}" != "${derived_public_key}" ]]; then
+      echo "WARN: REALITY_PUBLIC_KEY does not match REALITY_PRIVATE_KEY; overriding with derived public key." >&2
     fi
+    REALITY_PUBLIC_KEY="${derived_public_key}"
   fi
 
   if [[ -z "${REALITY_PRIVATE_KEY}" || -z "${REALITY_PUBLIC_KEY}" ]]; then
@@ -647,7 +665,8 @@ EOF_XHTTP
 activate_xray() {
   "${XRAY_BIN}" run -test -config "${XRAY_CONFIG}"
   systemctl daemon-reload
-  systemctl enable --now xray
+  systemctl enable xray
+  systemctl restart xray
 }
 
 setup_traffic_shaping() {
@@ -818,6 +837,14 @@ main() {
   local reality_profile_explicit="false"
   local reality_server_name_explicit="false"
   local reality_dest_explicit="false"
+  local reality_short_id_explicit="false"
+  local reality_private_key_explicit="false"
+  local reality_public_key_explicit="false"
+  local exit_host_explicit="false"
+  local exit_port_explicit="false"
+  local exit_path_explicit="false"
+  local exit_server_name_explicit="false"
+  local bridge_uuid_for_exit_explicit="false"
 
   if [[ "${REALITY_PROFILE+x}" == "x" ]]; then
     reality_profile_explicit="true"
@@ -827,6 +854,30 @@ main() {
   fi
   if [[ "${REALITY_DEST+x}" == "x" ]]; then
     reality_dest_explicit="true"
+  fi
+  if [[ "${REALITY_SHORT_ID+x}" == "x" ]]; then
+    reality_short_id_explicit="true"
+  fi
+  if [[ "${REALITY_PRIVATE_KEY+x}" == "x" ]]; then
+    reality_private_key_explicit="true"
+  fi
+  if [[ "${REALITY_PUBLIC_KEY+x}" == "x" ]]; then
+    reality_public_key_explicit="true"
+  fi
+  if [[ "${EXIT_HOST+x}" == "x" ]]; then
+    exit_host_explicit="true"
+  fi
+  if [[ "${EXIT_PORT+x}" == "x" ]]; then
+    exit_port_explicit="true"
+  fi
+  if [[ "${EXIT_PATH+x}" == "x" ]]; then
+    exit_path_explicit="true"
+  fi
+  if [[ "${EXIT_SERVER_NAME+x}" == "x" ]]; then
+    exit_server_name_explicit="true"
+  fi
+  if [[ "${BRIDGE_UUID_FOR_EXIT+x}" == "x" ]]; then
+    bridge_uuid_for_exit_explicit="true"
   fi
 
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -882,15 +933,15 @@ main() {
 
   setup_packages
   setup_time_and_sysctl
-  inherit_from_xray_config_if_empty REALITY_PRIVATE_KEY '.inbounds[] | select(.tag == "inbound-from-users") | .streamSettings.realitySettings.privateKey // empty'
-  inherit_from_xray_config_if_empty REALITY_SHORT_ID '.inbounds[] | select(.tag == "inbound-from-users") | .streamSettings.realitySettings.shortIds[0] // empty'
-  inherit_from_xray_config_if_empty REALITY_SERVER_NAME '.inbounds[] | select(.tag == "inbound-from-users") | .streamSettings.realitySettings.serverNames[0] // empty'
-  inherit_from_xray_config_if_empty REALITY_DEST '.inbounds[] | select(.tag == "inbound-from-users") | .streamSettings.realitySettings.dest // empty'
-  inherit_from_xray_config_if_empty EXIT_HOST '.outbounds[] | select(.tag == "to-exit") | .settings.vnext[0].address // empty'
-  inherit_from_xray_config_if_empty EXIT_PORT '.outbounds[] | select(.tag == "to-exit") | .settings.vnext[0].port // empty'
-  inherit_from_xray_config_if_empty EXIT_PATH '.outbounds[] | select(.tag == "to-exit") | .streamSettings.xhttpSettings.path // empty'
-  inherit_from_xray_config_if_empty EXIT_SERVER_NAME '.outbounds[] | select(.tag == "to-exit") | .streamSettings.tlsSettings.serverName // empty'
-  inherit_from_xray_config_if_empty BRIDGE_UUID_FOR_EXIT '.outbounds[] | select(.tag == "to-exit") | .settings.vnext[0].users[0].id // empty'
+  sync_from_xray_config_unless_explicit REALITY_PRIVATE_KEY '.inbounds[] | select(.tag == "inbound-from-users") | .streamSettings.realitySettings.privateKey // empty' "${reality_private_key_explicit}"
+  sync_from_xray_config_unless_explicit REALITY_SHORT_ID '.inbounds[] | select(.tag == "inbound-from-users") | .streamSettings.realitySettings.shortIds[0] // empty' "${reality_short_id_explicit}"
+  sync_from_xray_config_unless_explicit REALITY_SERVER_NAME '.inbounds[] | select(.tag == "inbound-from-users") | .streamSettings.realitySettings.serverNames[0] // empty' "${reality_server_name_explicit}"
+  sync_from_xray_config_unless_explicit REALITY_DEST '.inbounds[] | select(.tag == "inbound-from-users") | .streamSettings.realitySettings.dest // empty' "${reality_dest_explicit}"
+  sync_from_xray_config_unless_explicit EXIT_HOST '.outbounds[] | select(.tag == "to-exit") | .settings.vnext[0].address // empty' "${exit_host_explicit}"
+  sync_from_xray_config_unless_explicit EXIT_PORT '.outbounds[] | select(.tag == "to-exit") | .settings.vnext[0].port // empty' "${exit_port_explicit}"
+  sync_from_xray_config_unless_explicit EXIT_PATH '.outbounds[] | select(.tag == "to-exit") | .streamSettings.xhttpSettings.path // empty' "${exit_path_explicit}"
+  sync_from_xray_config_unless_explicit EXIT_SERVER_NAME '.outbounds[] | select(.tag == "to-exit") | .streamSettings.tlsSettings.serverName // empty' "${exit_server_name_explicit}"
+  sync_from_xray_config_unless_explicit BRIDGE_UUID_FOR_EXIT '.outbounds[] | select(.tag == "to-exit") | .settings.vnext[0].users[0].id // empty' "${bridge_uuid_for_exit_explicit}"
   apply_reality_profile_defaults "${reality_profile_explicit}" "${reality_server_name_explicit}" "${reality_dest_explicit}"
   setup_ufw
   install_xray
